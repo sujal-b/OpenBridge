@@ -1,11 +1,11 @@
 # Mind-Limb Bridge
 
-A small local Brain (MIND/Codex) -> HANDS (OpenCode) workflow with approval,
-visibility, and one active agent at a time.
+A small local Brain (MIND/Codex) <-> HANDS (OpenCode) workflow with autonomous
+Brain handoffs, visibility, and one active agent at a time.
 
 ## Model routing
 
-- HANDS and HANDS-PROPOSE use OpenCode Zen's current rolling alias: `opencode/deepseek-v4-flash-free`.
+- HANDS, HANDS-PROPOSE, and HANDS-EVALUATE use OpenCode Zen's current rolling alias: `opencode/deepseek-v4-flash-free`.
 - MIND and HANDS-to-MIND `ask_codex` guidance use `gpt-5.6-terra` with high reasoning.
 
 ## Public commands
@@ -16,33 +16,51 @@ bridge open .
 bridge run "Add upload validation"
 bridge watch
 bridge inspect
+bridge status
+bridge unlock
+bridge unlock-agent
 ```
 
+For a new disposable or mock project, use one command:
+
+```powershell
+bridge new "D:\Projects\Bridge-Mock-E2E" --name "Sujal Barwad" --email "sujal.barwad27@gmail.com"
+Set-Location "D:\Projects\Bridge-Mock-E2E"
+bridge run "your task"
+```
+
+The `--name` and `--email` flags are optional when Git identity is already configured globally. For an existing project, keep using `bridge open`.
+
 `bridge open .` also creates missing project-local OpenCode profiles under
-`.opencode/agents/`. It never overwrites existing profiles or changes global
-settings. The consultation profile allows only the Brain MCP tool; the
-execution profile explicitly denies `ask_codex`, subagents, skills, and
-external-directory access. The global `ask-codex` MCP server must still be
+`.opencode/agents/` and creates or updates the root `.gitignore` with
+`.bridge/`, `.opencode/`, `node_modules/`, and `dist/` runtime entries. Existing
+`.gitignore` content and profiles are preserved; entries are added idempotently.
+It never changes global settings. The consultation profile allows only the Brain MCP
+tool; the execution profile may edit only approved files, while evaluation denies edits, subagents,
+skills, and external-directory access. `hands-evaluate` is the read-only role
+for checking the completed chunk and its validation evidence. The global `ask-codex` MCP server must still be
 installed once. Because the profiles are project files, run `bridge open .`
 before creating the first baseline commit, or commit the newly-created
 `.opencode/agents/` files once in an existing repository.
 
-bridge run starts or continues the current task. HANDS must propose one small
-chunk with named files and focused validation. The bridge requires a Git
-repository with a baseline commit before approval. The sequence is:
+bridge run starts or continues the current task. HANDS proposes one small chunk
+with named files and focused validation. The bridge requires a Git repository
+with a baseline commit before the Brain <-> HANDS handoff. The autonomous sequence is:
 
-    proposal -> Brain approval -> read-only Brain consultation -> one execution lease -> Brain review
+    proposal -> Brain evaluates -> read-only Brain consultation -> one execution lease -> HANDS-EVALUATE/Brain review
 
-Only the lease holder can execute the approved files. A lease is claimed once;
+The loop advances without an ordinary user approval prompt. `bridge approve` remains
+a compatibility command for manually controlled sessions. Only the lease holder can
+execute the approved files. A lease is claimed once;
 if execution is interrupted, recovery invalidates it and the next run must
 consult Brain again. A new chunk cannot start until Brain uses bridge done or
 bridge revise.
 
-If HANDS has a material question, it stops safely. Answer it with:
+If HANDS cannot make a safe, reviewable proposal because of a material dependency, it stops safely. Answer it with:
 bridge revise "Use the minimal implementation with focused tests"
 
 ```powershell
-bridge approve
+# Only needed when a proposal is blocked or needs correction
 bridge revise "Use a smaller change and add a unit test"
 bridge done "Reviewed changes and tests pass"
 ```
@@ -52,7 +70,9 @@ For a project in another folder, add `--project <folder>` to any command.
 ## Live monitoring
 
 `bridge watch` is the compact terminal dashboard. It repaints one frame, so it
-does not print the same status repeatedly. During `hands_consulting`, it shows
+does not print the same status repeatedly. The Flow line shows the autonomous
+Brain <-> HANDS handoff and Evaluation shows the latest read-only review. During
+`hands_consulting`, it shows
 that HANDS is waiting for Brain guidance; during `hands_executing`, it shows
 the claimed chunk and the live activity summary.
 
@@ -81,6 +101,7 @@ Optional PowerShell settings:
     $env:MIND_LIMB_AGENT_RETRY_DELAY_MS = 250
     $env:MIND_LIMB_PROPOSAL_TIMEOUT_MS = 180000
     $env:MIND_LIMB_EXECUTION_TIMEOUT_MS = 600000
+    $env:MIND_LIMB_AGENT_TIMEOUT_MS = 300000
     $env:MIND_LIMB_MAX_CHUNK_FILES = 3
     $env:MIND_LIMB_BRIDGE_TIMEOUT_MS = 630000
 
@@ -113,15 +134,17 @@ stale-lock cleanup.
 ## Safety and records
 
 - `.bridge/state.json` is the authoritative state.
+- `.bridge/state.json.corrupt-*` keeps a repaired corrupt snapshot for up to 7 days.
 - `.bridge/events.jsonl` is the lifecycle overview log.
 - `.bridge/actions.jsonl` records bounded provider/tool summaries; secrets are redacted.
 - `.bridge/policy.json` stores safe defaults and project overrides.
 - `.bridge/agent.lock` prevents parallel HANDS calls.
 - The HANDS session ID is preserved across chunks.
-- A dirty Git tree blocks approval; non-Git projects cannot enter execution.
+- A dirty Git tree blocks the Brain <-> HANDS execution handoff; non-Git projects cannot enter execution.
 - Changed files are checked against the approved file list, including untracked,
   deleted, renamed, and out-of-scope paths.
-- Provider failures and blocked questions wait for the user.
+- Provider failures can be resumed; material proposal blockers require bridge revise.
+- `hands-evaluate` is read-only and reports pass/fail evidence without changing files.
 - A single-use execution lease prevents duplicate provider execution.
 - State, plan, and event commits have a short crash-recovery journal.
 
@@ -140,6 +163,10 @@ Run the focused Control Room checks first:
 Run the recovery checks:
 
     & .\evaluate-recovery.ps1
+
+The `qa-*` Node suites cover detector, recovery, state, race, and CLI regressions.
+`MIND_LIMB_AGENT_TIMEOUT_MS` supplies proposal, execution, and consultation defaults;
+per-command `--timeout-ms` takes precedence, then this variable, then built-in defaults.
 
 Run the isolated pre-production suite:
 
