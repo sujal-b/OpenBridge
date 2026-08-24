@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mind-Limb Bridge Inspector</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2e; --panel2:#18233d; --line:#263556; --text:#eef4ff; --muted:#91a0bd; --cyan:#68d8ff; --green:#75e6a1; --yellow:#ffd166; --red:#ff7d8d; --purple:#bda3ff; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    * { box-sizing:border-box; }
+    body { margin:0; min-height:100vh; background:radial-gradient(circle at 10% 0%, #1b2d52 0, transparent 38rem), var(--bg); color:var(--text); }
+    header { position:sticky; top:0; z-index:5; backdrop-filter:blur(14px); background:#0b1020dd; border-bottom:1px solid var(--line); padding:18px clamp(16px, 4vw, 48px); display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:clamp(1.05rem, 2vw, 1.45rem); letter-spacing:.02em; }
+    h2 { font-size:1rem; margin-bottom:12px; }
+    .sub { color:var(--muted); font-size:.84rem; margin-top:5px; }
+    .live { display:flex; align-items:center; gap:8px; color:var(--green); font-size:.82rem; white-space:nowrap; }
+    .dot { width:9px; height:9px; border-radius:50%; background:var(--green); box-shadow:0 0 16px var(--green); }
+    .dot.off { background:var(--red); box-shadow:0 0 16px var(--red); }
+    main { width:min(1500px, 100%); margin:0 auto; padding:24px clamp(16px, 4vw, 48px) 48px; }
+    .hero { display:grid; grid-template-columns:1.4fr .6fr; gap:16px; margin-bottom:16px; }
+    .panel { background:linear-gradient(145deg, #16213aee, #10182bee); border:1px solid var(--line); border-radius:18px; box-shadow:0 14px 40px #0003; }
+    .hero .panel { padding:20px; }
+    .phase { display:flex; align-items:center; gap:10px; margin-top:18px; }
+    .phase strong { font-size:1.4rem; letter-spacing:.05em; }
+    .badge { border-radius:999px; padding:5px 9px; font-size:.72rem; border:1px solid currentColor; text-transform:uppercase; }
+    .normal { color:var(--cyan); } .good { color:var(--green); } .warn { color:var(--yellow); } .danger { color:var(--red); }
+    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+    .stat { padding:12px; border:1px solid var(--line); border-radius:12px; background:#0c1426aa; min-width:0; }
+    .label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.08em; }
+    .value { margin-top:6px; font-size:.92rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    button { cursor:pointer; border:1px solid var(--line); border-radius:10px; padding:8px 11px; background:#1a2948; color:var(--text); font:inherit; font-size:.82rem; }
+    button:hover { border-color:var(--cyan); transform:translateY(-1px); }
+    button:disabled { cursor:not-allowed; opacity:.4; transform:none; }
+    .layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(280px, .42fr); gap:16px; align-items:start; }
+    .section { padding:18px; }
+    .section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+    #timeline { display:grid; gap:12px; }
+    .chunk { border:1px solid var(--line); border-radius:14px; overflow:hidden; background:#0c1426aa; }
+    .chunk-head { padding:12px 14px; background:#172440; display:flex; justify-content:space-between; gap:12px; align-items:center; }
+    .chunk-title { font-weight:700; font-size:.88rem; }
+    .chunk-meta { color:var(--muted); font-size:.73rem; }
+    .event { display:grid; grid-template-columns:92px 1fr auto; gap:12px; padding:12px 14px; border-top:1px solid #21304d; cursor:pointer; }
+    .event:hover,.event.selected { background:#1a2948; }
+    .event-time { color:var(--muted); font: .72rem ui-monospace, monospace; }
+    .event-main { min-width:0; }
+    .event-title { font-size:.84rem; font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .event-summary { color:var(--muted); font-size:.76rem; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .event-tag { align-self:start; font-size:.68rem; border-radius:999px; padding:4px 7px; border:1px solid var(--line); color:var(--cyan); }
+    .event-tag.risk { color:var(--yellow); } .event-tag.error { color:var(--red); }
+    #detail { min-height:260px; }
+    .detail-empty { color:var(--muted); line-height:1.6; }
+    .detail-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin:12px 0; }
+    .detail-item { border:1px solid var(--line); border-radius:10px; padding:9px; min-width:0; }
+    .detail-item .value { white-space:normal; overflow-wrap:anywhere; }
+    pre { white-space:pre-wrap; overflow:auto; max-height:300px; background:#080d19; border:1px solid var(--line); border-radius:10px; padding:12px; font:.76rem ui-monospace,monospace; color:#cfe2ff; }
+    .diff { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .diff h3 { font-size:.72rem; color:var(--muted); margin-bottom:5px; }
+    .notice { margin-bottom:16px; padding:11px 13px; border:1px solid #725c24; color:var(--yellow); background:#3b301522; border-radius:10px; display:none; }
+    .notice.show { display:block; }
+    @media (max-width:900px) { .hero,.layout { grid-template-columns:1fr; } .stats { grid-template-columns:repeat(2,1fr); } }
+    @media (max-width:560px) { .event { grid-template-columns:1fr auto; } .event-time { grid-column:1/-1; } .diff { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Mind-Limb Bridge Inspector</h1><p class="sub" id="project">Connecting...</p></div>
+    <div class="live"><span class="dot" id="liveDot"></span><span id="liveText">LIVE</span></div>
+  </header>
+  <main>
+    <div class="notice" id="notice"></div>
+    <section class="hero">
+      <div class="panel">
+        <div class="label">Current workflow</div>
+        <div class="phase"><strong id="phase">UNKNOWN</strong><span class="badge normal" id="agent">IDLE</span></div>
+        <p class="sub" id="task">No active task</p>
+      </div>
+      <div class="panel">
+        <div class="label">Controls</div>
+        <div class="controls" data-control-owner="bridge" data-control-policy="one control at a time" style="margin-top:14px">
+          <button data-control="approve">Approve</button><button data-control="revise">Revise</button><button data-control="pause">Pause</button><button data-control="resume">Resume</button><button data-control="recover">Recover</button><button data-control="done">Finish</button><button data-control="stop">Stop</button>
+        </div>
+        <p class="sub" style="margin-top:12px">Bridge controls this session; one control at a time. Controls are phase-aware and synchronized with the terminal.</p>
+      </div>
+    </section>
+    <div id="control-room-hook" data-agent="mind-hands" aria-label="MIND and HANDS live control room"></div><section class="stats" style="margin-bottom:16px">
+      <div class="stat"><div class="label">Approval</div><div class="value" id="approval">-</div></div>
+      <div class="stat"><div class="label">Now</div><div class="value" id="now">-</div></div>
+      <div class="stat"><div class="label">Git</div><div class="value" id="git">-</div></div>
+      <div class="stat"><div class="label">Events</div><div class="value" id="counts">0</div></div>
+    </section>
+    <div class="layout">
+      <section class="panel section"><div class="section-head"><h2>Session timeline</h2><span class="sub" id="updated">Waiting for first snapshot</span></div><div id="timeline"></div></section>
+      <aside class="panel section"><div class="section-head"><h2>Expanded detail</h2><span class="sub" id="detailKind">Select an event</span></div><div id="detail"><p class="detail-empty">Select an activity card to inspect its intent, target, result, risk, and available details.</p></div></aside>
+    </div>
+  </main>
+  <script>
+    const $ = selector => document.querySelector(selector);
+    const state = { snapshot: null, selected: null, source: null };
+    const phaseControls = {
+      idle: ['stop'],
+      brain_approving: ['approve','revise','pause','stop'],
+      paused: ['resume','stop'],
+      blocked_user: ['resume','stop'],
+      hands_executing: ['recover'],
+      planning: ['pause','stop'],
+      hands_proposing: ['pause','stop'],
+      brain_reviewing: ['done','pause','stop']
+    };
+    function text(value, fallback = '-') { return value === undefined || value === null || value === '' ? fallback : String(value); }
+    function setText(selector, value, fallback) { $(selector).textContent = text(value, fallback); }
+    function safeDate(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '-' : date.toLocaleTimeString(); }
+    function eventKey(event) { return [event.kind, event.id, event.seq, event.at].join(':'); }
+    function allEntries(snapshot) {
+      const events = (snapshot.events || []).map(event => ({ ...event, source:'lifecycle', kind:event.kind || event.type || 'lifecycle', summary:event.summary || event.type || 'Lifecycle event' }));
+      const actions = (snapshot.actions || []).map(action => ({ ...action, source:'action', kind:action.kind || 'action', summary:action.summary || 'Action' }));
+      return [...events, ...actions].sort((a,b) => String(a.at).localeCompare(String(b.at)) || Number(a.seq || 0) - Number(b.seq || 0));
+    }
+    function groupKey(event, snapshot) { return event.assignment_id || (snapshot.state && snapshot.state.assignment_id) || 'session'; }
+    function statusClass(event) { if (event.status === 'error' || event.type === 'session_cancelled') return 'error'; if (event.risk === 'high' || event.risk === 'critical') return 'risk'; return ''; }
+    function renderSummary(snapshot) {
+      const current = snapshot.state || {};
+      setText('#project', snapshot.project);
+      setText('#phase', current.phase, 'UNKNOWN');
+      setText('#agent', current.active_agent, 'IDLE');
+      setText('#task', current.task, 'No active task');
+      setText('#approval', current.approval);
+      setText('#now', current.activity && current.activity.action || current.last_summary);
+      setText('#git', current.git_status);
+      setText('#counts', String((snapshot.events || []).length) + ' lifecycle / ' + String((snapshot.actions || []).length) + ' actions');
+      setText('#updated', 'Updated ' + safeDate(snapshot.generated_at));
+      const phase = String(current.phase || '').toLowerCase();
+      $('#phase').className = phase === 'blocked_user' ? 'danger' : phase === 'done' ? 'good' : 'normal';
+      const allowed = phaseControls[phase] || [];
+      document.querySelectorAll('[data-control]').forEach(button => { button.disabled = !allowed.includes(button.dataset.control); });
+      if (snapshot.warnings && snapshot.warnings.length) showNotice(snapshot.warnings.map(item => item.message).join(' ')); else hideNotice();
+    }
+    function renderTimeline(snapshot) {
+      const timeline = $('#timeline'); timeline.replaceChildren();
+      const entries = allEntries(snapshot); if (!entries.length) { const empty = document.createElement('p'); empty.className='detail-empty'; empty.textContent='No activity yet.'; timeline.append(empty); return; }
+      const groups = new Map();
+      for (const event of entries) { const key = groupKey(event, snapshot); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(event); }
+      for (const [key, group] of groups) {
+        const chunk = document.createElement('section'); chunk.className='chunk';
+        const head = document.createElement('div'); head.className='chunk-head';
+        const title = document.createElement('div'); title.className='chunk-title'; title.textContent = key === 'session' ? 'Session activity' : 'Task chunk ' + key;
+        const meta = document.createElement('div'); meta.className='chunk-meta'; meta.textContent = group.length + ' events'; head.append(title, meta); chunk.append(head);
+        for (const event of group.slice(-80)) {
+          const row = document.createElement('div'); row.className='event' + (state.selected === eventKey(event) ? ' selected' : ''); row.addEventListener('click', () => { state.selected = eventKey(event); renderTimeline(snapshot); renderDetail(event); });
+          const time = document.createElement('div'); time.className='event-time'; time.textContent=safeDate(event.at);
+          const main = document.createElement('div'); main.className='event-main'; const titleNode=document.createElement('div'); titleNode.className='event-title'; titleNode.textContent=text(event.agent || event.active_agent, 'system') + ' · ' + text(event.kind || event.type, 'event'); const summary=document.createElement('div'); summary.className='event-summary'; summary.textContent=text(event.summary); main.append(titleNode,summary);
+          const tag=document.createElement('div'); tag.className='event-tag ' + statusClass(event); tag.textContent=text(event.status || event.phase || 'event'); row.append(time,main,tag); chunk.append(row);
+        }
+        timeline.append(chunk);
+      }
+      if (state.selected) { const selected = entries.find(event => eventKey(event) === state.selected); if (selected) renderDetail(selected); else { state.selected = null; renderDetail(null); } }
+    }
+    function detailItem(parent, label, value) { const item=document.createElement('div'); item.className='detail-item'; const l=document.createElement('div'); l.className='label'; l.textContent=label; const v=document.createElement('div'); v.className='value'; v.textContent=text(value); item.append(l,v); parent.append(item); }
+    function renderDetail(event) {
+      if (!event) { $('#detailKind').textContent='Select an event'; const empty=document.createElement('p'); empty.className='detail-empty'; empty.textContent='Select an activity card to inspect its intent, target, result, risk, and available details.'; $('#detail').replaceChildren(empty); return; } $('#detailKind').textContent=text(event.kind || event.type, 'event'); const detail=$('#detail'); detail.replaceChildren(); const grid=document.createElement('div'); grid.className='detail-grid'; [['Agent',event.agent || event.active_agent],['Action',event.kind || event.type],['Target',event.target],['Status',event.status || event.phase],['Risk',event.risk],['Duration',event.duration_ms === null || event.duration_ms === undefined ? '-' : event.duration_ms + ' ms'],['Revision',event.revision || event.chunk],['At',event.at]].forEach(pair=>detailItem(grid,pair[0],pair[1])); detail.append(grid); const summary=document.createElement('p'); summary.className='sub'; summary.textContent=text(event.summary); detail.append(summary);
+      if (event.detail_ref) { const ref=document.createElement('pre'); ref.textContent='Details: ' + event.detail_ref; detail.append(ref); }
+      if (event.before !== undefined || event.after !== undefined) { const diff=document.createElement('div'); diff.className='diff'; for (const part of [['Before',event.before],['After',event.after]]) { const box=document.createElement('div'); const h=document.createElement('h3'); h.textContent=part[0]; const pre=document.createElement('pre'); pre.textContent=text(part[1]); box.append(h,pre); diff.append(box); } detail.append(diff); }
+    }
+    function showNotice(message) { const node=$('#notice'); node.textContent=message; node.classList.add('show'); }
+    function hideNotice() { $('#notice').classList.remove('show'); }
+    function apply(snapshot) { if (!snapshot) return; window.__bridgeSnapshot=snapshot; window.dispatchEvent(new CustomEvent('bridge-snapshot',{detail:snapshot})); state.snapshot=snapshot; renderSummary(snapshot); renderTimeline(snapshot); }
+    async function sendControl(action) { const payload={action}; if (action === 'approve' || action === 'revise' || action === 'done') payload.summary=window.prompt(action === 'approve' ? 'Approval note' : action === 'done' ? 'Completion note' : 'Revision request') || ''; try { const response=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const value=await response.json(); if (!response.ok) throw new Error(value.error || 'Control failed'); apply(value.snapshot); showNotice(action + ' completed.'); } catch(error) { showNotice(error.message); } }
+    document.querySelectorAll('[data-control]').forEach(button => button.addEventListener('click', () => sendControl(button.dataset.control)));
+    async function initial() { try { state.lastSignalAt=Date.now(); apply(await (await fetch('/api/snapshot')).json()); state.source=new EventSource('/api/stream'); ['snapshot','update'].forEach(type => state.source.addEventListener(type, event => { try { state.lastSignalAt=Date.now(); apply(JSON.parse(event.data)); $('#liveText').textContent='LIVE'; $('#liveDot').classList.remove('off'); } catch { showNotice('The inspector received an invalid update.'); } })); state.source.addEventListener('ping', () => { state.lastSignalAt=Date.now(); window.dispatchEvent(new CustomEvent('bridge-ping')); }); state.source.onerror=()=>{ $('#liveText').textContent='RECONNECTING'; $('#liveDot').classList.add('off'); window.dispatchEvent(new CustomEvent('bridge-connection',{detail:'error'})); }; } catch(error) { showNotice(error.message); $('#liveText').textContent='OFFLINE'; $('#liveDot').classList.add('off'); window.dispatchEvent(new CustomEvent('bridge-connection',{detail:'offline'})); } }
+    initial();
+  </script>
+<script src="inspector-control-room.js"></script>
+</body>
+</html>
