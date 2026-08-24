@@ -1,0 +1,24 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "local-router": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local Router",
+      "options": {
+        "baseURL": "http://localhost:20128/v1",
+        "apiKey": "{env:OPENCODE_API_KEY}"
+      },
+      "models": {
+        "bd/Deepseek-V4-Flash-0731": {
+          "name": "Deepseek-V4-Flash-0731"
+        },
+        "oc/x-preview-f-free": {
+          "name": "x-preview-f-free"
+        },
+        "bd/Kimi-k2.7-code": {
+          "name": "Kimi-k2.7-code"
+        }
+      }
+    }
+  }
+}

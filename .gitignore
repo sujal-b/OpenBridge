@@ -1,1 +1,16 @@
-﻿.bridge/
+.bridge/
+.env
+.env.*
+*.log
+_e2e-*/
+_matrix-*/
+_fix-smoke-*/
+node_modules/
+npm-debug.log*
+.DS_Store
+*.pem
+*.key
+tmp/
+dist/
+build/
+coverage/

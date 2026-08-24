@@ -10,6 +10,8 @@ const path = require('node:path');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
 const { defaultPolicy } = require('./bridge-policy');
+const { renameWithRetry } = require('./bridge-atomic');
+const { isLegacyConsultationRetry, coerceEventSeq, lastEvent } = require('./bridge-state');
 
 const execFileAsync = promisify(execFile);
 const root = process.cwd();
@@ -28,16 +30,18 @@ const phases = new Set([
   'done', 'cancelled'
 ]);
 
+const blockKinds = new Set(['needs_revision', 'consultation_retry', 'escalation']);
+
 const transitions = {
   idle: ['planning', 'cancelled'],
   planning: ['hands_proposing', 'blocked_user', 'paused', 'cancelled'],
-  hands_proposing: ['brain_approving', 'blocked_user', 'paused', 'cancelled'],
+  hands_proposing: ['brain_approving', 'hands_proposing', 'blocked_user', 'paused', 'cancelled'],
   brain_approving: ['hands_proposing', 'hands_consulting', 'blocked_user', 'paused', 'cancelled'],
-  hands_consulting: ['hands_executing', 'blocked_user', 'paused', 'cancelled'],
-  hands_executing: ['brain_reviewing', 'blocked_user', 'paused', 'cancelled'],
-  brain_reviewing: ['planning', 'done', 'blocked_user', 'paused', 'cancelled'],
+  hands_consulting: ['hands_executing', 'hands_proposing', 'blocked_user', 'paused', 'cancelled'],
+  hands_executing: ['brain_reviewing', 'hands_proposing', 'blocked_user', 'paused', 'cancelled'],
+  brain_reviewing: ['planning', 'hands_proposing', 'done', 'blocked_user', 'paused', 'cancelled'],
   blocked_user: ['planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'hands_executing', 'brain_reviewing', 'paused', 'cancelled'],
-  paused: ['planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'hands_executing', 'brain_reviewing', 'cancelled'],
+  paused: ['planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'hands_executing', 'brain_reviewing', 'blocked_user', 'cancelled'],
   done: ['planning'],
   cancelled: ['planning']
 };
@@ -67,6 +71,7 @@ function initialState() {
     revision: 0,
     approach: null,
     approval: 'none',
+    autonomy: { mode: 'manual', approved_by: null, approved_at: null },
     consultation: null,
     execution_lease_id: null,
     revision_consumed: false,
@@ -76,12 +81,35 @@ function initialState() {
     git_after: null,
     git_status: 'unknown',
     blocked_reason: null,
+    block_kind: null,
     recovery_required: false,
     mind_feedback: null,
+    evaluation: { status: 'idle', summary: null, at: null },
     resume_phase: null,
     event_seq: 0,
     last_summary: 'Bridge initialized',
     updated_at: now()
+  };
+}
+
+function approachMetadata(revision, status = 'awaiting_brain') {
+  return {
+    roles: { planner: 'brain', proposer: 'hands', executor: 'hands', reviewer: 'brain', primary: 'task-matched engineer' },
+    handoff: { from: 'hands', to: 'brain', status, revision }
+  };
+}
+
+function normalizeApproach(approach) {
+  if (!approach || typeof approach !== 'object') return null;
+  const metadata = approachMetadata(Number(approach.revision) || 0);
+  return {
+    ...approach,
+    files: Array.isArray(approach.files) ? approach.files : [],
+    risks: Array.isArray(approach.risks) ? approach.risks : [],
+    acceptance: Array.isArray(approach.acceptance) ? approach.acceptance : [],
+    roles: { ...metadata.roles, ...(approach.roles || {}) },
+    handoff: { ...metadata.handoff, ...(approach.handoff || {}) },
+    role: typeof approach.role === 'string' && approach.role.trim() ? approach.role.trim().slice(0, 120) : 'task-matched engineer'
   };
 }
 
@@ -98,7 +126,7 @@ async function writeJsonAtomic(file, value) {
   const temp = file + '.' + process.pid + '.' + crypto.randomBytes(5).toString('hex') + '.tmp';
   try {
     await fs.writeFile(temp, JSON.stringify(value, null, 2) + '\n', 'utf8');
-    await fs.rename(temp, file);
+    await renameWithRetry(temp, file);
   } finally {
     await fs.unlink(temp).catch(error => {
       if (error.code !== 'ENOENT') throw error;
@@ -149,7 +177,7 @@ async function writeTextAtomic(file, text) {
   const temp = file + '.' + process.pid + '.' + crypto.randomBytes(5).toString('hex') + '.tmp';
   try {
     await fs.writeFile(temp, text, 'utf8');
-    await fs.rename(temp, file);
+    await renameWithRetry(temp, file);
   } finally {
     await fs.unlink(temp).catch(error => {
       if (error.code !== 'ENOENT') throw error;
@@ -213,7 +241,12 @@ async function ensureStore() {
     }
     try {
       const stateCreated = !(await exists(stateFile));
+      const eventInfo = stateCreated ? await lastEvent(root) : { seq: -1, session_id: null };
       const initial = stateCreated ? initialState() : null;
+      if (initial && eventInfo.seq >= 0) {
+        initial.event_seq = eventInfo.seq;
+        if (eventInfo.session_id) initial.session_id = eventInfo.session_id;
+      }
       if (initial) await writeJsonAtomic(stateFile, initial);
       if (!(await exists(eventsFile))) {
         const event = initial
@@ -235,21 +268,87 @@ async function ensureStore() {
 
 function normalizeState(state) {
   const defaults = initialState();
-  return {
+  const normalized = {
     ...defaults,
     ...state,
     activity: { ...defaults.activity, ...(state.activity || {}) },
+    approach: normalizeApproach(state.approach),
+    autonomy: { ...defaults.autonomy, ...(state.autonomy || {}) },
+    evaluation: { ...defaults.evaluation, ...(state.evaluation || {}) },
     consultation: state.consultation ?? null,
     execution_lease_id: state.execution_lease_id ?? null,
     revision_consumed: state.revision_consumed === true,
     execution_claimed: state.execution_claimed === true,
-    execution_started_at: state.execution_started_at ?? null
+execution_started_at: state.execution_started_at ?? null
   };
+  if (!phases.has(normalized.phase)) normalized.phase = 'idle';
+  normalized.event_seq = coerceEventSeq(state) ?? 0;
+  // Older runners marked transient ask_codex/MCP startup failures as revisions.
+  // Only migrate that exact consultation state; material consultation blocks stay revisions.
+  if (isLegacyConsultationRetry(normalized)) normalized.block_kind = 'consultation_retry';
+  return normalized;
+}
+
+async function lastEventSeq() {
+  let maxSeq = -1;
+  try {
+    const lines = (await fs.readFile(eventsFile, 'utf8')).trim().split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line);
+        if (Number.isInteger(event.seq) && event.seq >= 0 && event.seq > maxSeq) maxSeq = event.seq;
+      } catch {
+        // Skip broken log tails; continuity is derived from valid events only.
+      }
+    }
+  } catch {
+    // No readable events file; a fresh log starts at zero.
+  }
+  return maxSeq;
+}
+
+async function reinitializeState() {
+  await ensureStore();
+  const state = initialState();
+  const eventInfo = await lastEvent(root);
+  if (eventInfo.seq >= 0) {
+    state.event_seq = eventInfo.seq;
+    if (eventInfo.session_id) state.session_id = eventInfo.session_id;
+  }
+  await writeJsonAtomic(stateFile, state);
+  return state;
 }
 
 async function readState() {
   await ensureStore();
-  return normalizeState(JSON.parse(await fs.readFile(stateFile, 'utf8')));
+  // Keep corrupt snapshots for diagnosis briefly, then remove old repair litter.
+  const corruptCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  for (const name of await fs.readdir(bridgeDir).catch(() => [])) {
+    if (!name.startsWith('state.json.corrupt-')) continue;
+    const file = path.join(bridgeDir, name);
+    const stat = await fs.stat(file).catch(() => null);
+    if (stat && stat.mtimeMs < corruptCutoff) await fs.unlink(file).catch(() => {});
+  }
+  let raw;
+  try {
+    raw = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    await fs.rename(stateFile, stateFile + '.corrupt-' + Date.now().toString(36)).catch(unlinkError => {
+      if (unlinkError.code !== 'ENOENT') throw unlinkError;
+    });
+    raw = await reinitializeState();
+  }
+  const normalized = normalizeState(raw);
+  const repairedSeq = coerceEventSeq(raw) === null;
+  if (repairedSeq) {
+    const eventInfo = await lastEvent(root);
+    if (eventInfo.seq >= 0) normalized.event_seq = eventInfo.seq;
+  }
+  if (repairedSeq || raw.block_kind === 'needs_revision' && normalized.block_kind === 'consultation_retry') {
+    await writeJsonAtomic(stateFile, normalized);
+  }
+  return normalized;
 }
 
 async function acquireLock() {
@@ -292,8 +391,12 @@ async function withLock(action) {
 async function gitSnapshot() {
   let isRepo = false;
   try {
-    const repoResult = await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root });
-    isRepo = repoResult.stdout.trim() === 'true';
+    const toplevel = await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd: root });
+    const topPath = path.resolve(toplevel.stdout.trim());
+    if (topPath.toLowerCase() !== path.resolve(root).toLowerCase()) {
+      return { isRepo: false, head: null, dirty: false, status: [] };
+    }
+    isRepo = true;
   } catch {
     return { isRepo: false, head: null, dirty: false, status: [] };
   }
@@ -306,12 +409,15 @@ async function gitSnapshot() {
     // A repository may not have its first commit yet.
   }
 
-  const statusResult = await execFileAsync(
-    'git',
-    ['status', '--porcelain=v1', '--untracked-files=all'],
-    { cwd: root }
-  );
-  const lines = statusResult.stdout.split(/\r?\n/).filter(Boolean);
+  let lines = [];
+  try {
+    const statusResult = await execFileAsync(
+      'git',
+      ['status', '--porcelain=v1', '--untracked-files=all'],
+      { cwd: root, maxBuffer: 10 * 1024 * 1024 }
+    );
+    lines = statusResult.stdout.split(/\r?\n/).filter(Boolean);
+  } catch {}
   return { isRepo, head, dirty: lines.length > 0, status: lines };
 }
 
@@ -332,7 +438,7 @@ function repoPath(value) {
   while (normalized.startsWith('./')) normalized = normalized.slice(2);
   if (!normalized || normalized === '..' || normalized.startsWith('../')
     || path.posix.isAbsolute(normalized) || /^[A-Za-z]:\//.test(normalized)) return null;
-  return normalized;
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
 function requirePhase(state, expected) {
@@ -345,11 +451,14 @@ function assertTransition(from, to) {
 }
 
 function parseFiles(args) {
-  const marker = args.indexOf('--files');
-  if (marker < 0) return { text: args.join(' ').trim(), files: [] };
+  const manual = args.includes('--manual');
+  const values = args.filter(value => value !== '--manual');
+  const marker = values.indexOf('--files');
+  if (marker < 0) return { text: values.join(' ').trim(), files: [], manual };
   return {
-    text: args.slice(0, marker).join(' ').trim(),
-    files: args.slice(marker + 1).join(' ').split(',').map(item => item.trim()).filter(Boolean)
+    text: values.slice(0, marker).join(' ').trim(),
+    files: values.slice(marker + 1).join(' ').split(',').map(item => item.trim()).filter(Boolean),
+    manual
   };
 }
 
@@ -389,6 +498,9 @@ async function commit(next, type, summary, extra) {
     phase: next.phase,
     active_agent: next.active_agent,
     summary,
+    autonomy: next.autonomy,
+    handoff: next.approach?.handoff || null,
+    evaluation: next.evaluation,
     ...(extra || {})
   };
   const plan = renderPlan(next);
@@ -424,6 +536,7 @@ async function beginTask(task) {
     next.revision = 0;
     next.approach = null;
     next.approval = 'none';
+    next.autonomy = { mode: 'brain_autonomous', approved_by: null, approved_at: null };
     next.consultation = null;
     next.execution_lease_id = null;
     next.revision_consumed = false;
@@ -433,8 +546,10 @@ async function beginTask(task) {
     next.git_after = null;
     next.git_status = 'unknown';
     next.blocked_reason = null;
+    next.block_kind = null;
     next.recovery_required = false;
     next.mind_feedback = null;
+    next.evaluation = { status: 'idle', summary: null, at: null };
     next.activity = { agent: 'mind', action: 'Planning task', started_at: now() };
     next.resume_phase = null;
   });
@@ -474,16 +589,28 @@ async function submitApproach(args) {
     next.active_agent = 'mind';
     next.activity = { agent: 'mind', action: 'Waiting for approval', started_at: now() };
     next.revision += 1;
-    next.approach = { summary: parsed.text, files: parsed.files, risks: [], acceptance: [] };
+    const roleMatch = parsed.text.match(/(?:^|\n)Role:\s*([^\n]+)/i);
+    const role = roleMatch ? roleMatch[1].trim().slice(0, 120) : 'task-matched engineer';
+    next.approach = { summary: parsed.text, files: parsed.files, risks: [], acceptance: [], role, revision: next.revision, ...approachMetadata(next.revision) };
     next.mind_feedback = null;
+    next.autonomy = { mode: parsed.manual ? 'manual' : 'brain_autonomous', approved_by: null, approved_at: null };
+    next.evaluation = { status: 'idle', summary: null, at: null };
     next.approval = 'pending';
     next.blocked_reason = null;
+    next.block_kind = null;
   });
 }
 
 async function approve(summary) {
+  return approveApproach(summary, 'manual');
+}
+
+async function approveApproach(summary, mode = 'manual') {
   return mutate('approach_approved', summary || 'MIND approved the HANDS approach', async next => {
     requirePhase(next, 'brain_approving');
+    if (mode === 'manual' && next.autonomy?.mode === 'brain_autonomous') {
+      throw new Error('Ordinary approval is disabled for autonomous Brain review; wait for Brain or provide explicit revised guidance.');
+    }
     assertTransition(next.phase, 'hands_consulting');
     const git = await gitSnapshot();
     if (!git.isRepo) throw new Error('Execution requires a Git repository. Run "git init" and create a baseline commit before approval.');
@@ -494,6 +621,12 @@ async function approve(summary) {
     next.active_agent = 'hands-consult';
     next.activity = { agent: 'hands-consult', action: 'Consulting Brain before execution', started_at: now() };
     next.approval = 'approved';
+    next.autonomy = {
+      mode: mode === 'brain' ? 'brain_approved' : 'manual',
+      approved_by: mode === 'brain' ? 'brain' : 'user',
+      approved_at: now()
+    };
+    if (next.approach) next.approach.handoff = { ...(next.approach.handoff || {}), status: 'brain_approved' };
     next.consultation = null;
     next.execution_lease_id = null;
     next.revision_consumed = false;
@@ -502,6 +635,31 @@ async function approve(summary) {
     next.git_before = git.head;
     next.git_after = null;
     next.git_status = 'clean_before_execution';
+    next.block_kind = null;
+  });
+}
+
+async function brainApprove(summary) {
+  return approveApproach(summary || 'Brain approved the HANDS approach automatically.', 'brain');
+}
+
+async function recordEvaluation(payload) {
+  let evaluation;
+  try { evaluation = JSON.parse(String(payload || '')); } catch {
+    throw new Error('Invalid HANDS evaluation result.');
+  }
+  if (!evaluation || !['passed', 'failed', 'blocked'].includes(evaluation.decision)) {
+    throw new Error('HANDS evaluation decision must be passed, failed, or blocked.');
+  }
+  return mutate('evaluation_recorded', 'HANDS evaluation: ' + evaluation.decision, next => {
+    requirePhase(next, 'brain_reviewing');
+    next.evaluation = {
+      status: evaluation.decision,
+      summary: typeof evaluation.summary === 'string' ? evaluation.summary.trim().slice(0, 2000) : '',
+      at: now(),
+      tests: Array.isArray(evaluation.tests) ? evaluation.tests.slice(0, 30) : [],
+      risks: Array.isArray(evaluation.risks) ? evaluation.risks.slice(0, 30) : []
+    };
   });
 }
 
@@ -560,28 +718,16 @@ async function claimExecution(leaseId) {
 }
 
 async function revise(summary) {
-  const feedback = summary || 'MIND requested an approach revision';
+  const feedback = summary || 'User requested an approach revision';
   return mutate('approach_revision_requested', feedback, next => {
-    const fromBlockedClarification = next.phase === 'blocked_user'
-      && ['planning', 'hands_proposing'].includes(next.resume_phase);
-    const fromReview = next.phase === 'brain_reviewing';
-    if (fromBlockedClarification) {
-      assertTransition(next.phase, 'hands_proposing');
-      next.phase = 'hands_proposing';
-      next.active_agent = 'hands';
-      next.activity = { agent: 'hands', action: 'Preparing revised proposal', started_at: now() };
-    } else if (fromReview) {
-      assertTransition(next.phase, 'planning');
-      next.phase = 'planning';
-      next.active_agent = 'mind';
-      next.activity = { agent: 'mind', action: 'Planning the next chunk', started_at: now() };
-    } else {
-      requirePhase(next, 'brain_approving');
-      assertTransition(next.phase, 'hands_proposing');
-      next.phase = 'hands_proposing';
-      next.active_agent = 'hands';
-      next.activity = { agent: 'hands', action: 'Preparing revised proposal', started_at: now() };
+    // ponytail: allow mid-flight steering from any active phase directly to hands_proposing
+    if (['idle', 'done', 'cancelled'].includes(next.phase)) {
+      throw new Error('Cannot steer or revise when session is ' + next.phase + '.');
     }
+    assertTransition(next.phase, 'hands_proposing');
+    next.phase = 'hands_proposing';
+    next.active_agent = 'hands';
+    next.activity = { agent: 'hands', action: 'Preparing revised proposal with user guidance', started_at: now() };
     next.mind_feedback = feedback;
     next.consultation = null;
     next.execution_lease_id = null;
@@ -591,7 +737,31 @@ async function revise(summary) {
     next.revision += 1;
     next.approval = 'pending';
     next.blocked_reason = null;
+    next.block_kind = null;
     next.resume_phase = null;
+  });
+}
+
+async function continueChunk(summary) {
+  const feedback = summary || 'Brain requested the next bounded chunk';
+  return mutate('chunk_continuation_requested', feedback, next => {
+    requirePhase(next, 'brain_reviewing');
+    assertTransition(next.phase, 'planning');
+    next.phase = 'planning';
+    next.active_agent = 'mind';
+    next.activity = { agent: 'mind', action: 'Planning the next chunk', started_at: now() };
+    next.mind_feedback = feedback;
+    next.consultation = null;
+    next.execution_lease_id = null;
+    next.revision_consumed = false;
+    next.execution_claimed = false;
+    next.execution_started_at = null;
+    next.approval = 'none';
+    next.blocked_reason = null;
+    next.block_kind = null;
+    next.recovery_required = false;
+    next.resume_phase = null;
+    next.evaluation = { status: 'idle', summary: null, at: null };
   });
 }
 
@@ -623,6 +793,7 @@ async function complete(args) {
       next.git_status = 'scope_violation';
       next.recovery_required = true;
       next.resume_phase = 'hands_consulting';
+      next.block_kind = 'execution_recovery';
       const reason = headChanged ? 'the Git HEAD changed during execution' : 'files outside the approved scope';
       next.blocked_reason = 'HANDS modified ' + reason + (outOfScope.length ? ': ' + outOfScope.slice(0, 20).join(', ') : '.');
       return {
@@ -639,16 +810,23 @@ async function complete(args) {
   });
 }
 
-async function block(reason) {
+async function block(reason, kind = null) {
   if (!reason) throw new Error('A blocked reason is required.');
+  if (kind !== null && !blockKinds.has(kind)) {
+    throw new Error('Unsupported block kind: ' + kind + '.');
+  }
   return mutate('blocked_user', 'Waiting for user: ' + reason, next => {
     if (next.phase === 'blocked_user') return;
+    if (kind === 'consultation_retry' && next.phase !== 'hands_consulting') {
+      throw new Error('A consultation retry block is only valid while HANDS is consulting.');
+    }
     const interruptedExecution = next.phase === 'hands_executing';
     assertTransition(next.phase, 'blocked_user');
-    next.resume_phase = next.phase;
+    next.resume_phase = kind === 'consultation_retry' ? 'hands_consulting' : (kind === 'escalation' ? 'planning' : next.phase);
     next.recovery_required = interruptedExecution;
     next.phase = 'blocked_user';
     next.active_agent = 'user';
+    next.block_kind = interruptedExecution ? 'execution_recovery' : kind;
     next.activity = { agent: 'user', action: 'Waiting for user', started_at: now() };
     next.blocked_reason = reason;
   });
@@ -665,7 +843,10 @@ async function claimAgentLock(role) {
   } catch (error) {
     if (error.code !== 'EEXIST') throw error;
     const owner = await readLockOwner(file);
-    if (owner && owner.pid && !processAlive(Number(owner.pid))) {
+    const pid = owner && Number(owner.pid);
+    const validPid = Number.isInteger(pid) && pid > 0;
+    const stale = validPid ? !processAlive(pid) : await staleLock(file);
+    if (stale) {
       await fs.unlink(file).catch(unlinkError => {
         if (unlinkError.code !== 'ENOENT') throw unlinkError;
       });
@@ -691,6 +872,7 @@ async function recover() {
       if (next.phase === 'blocked_user' && next.recovery_required) {
         next.recovery_required = false;
         next.active_agent = 'user';
+        next.block_kind = null;
         next.activity = { agent: 'user', action: 'Recovery acknowledged; inspect complete', started_at: now() };
         next.blocked_reason = 'Recovery acknowledged. Run bridge resume only after confirming the working tree is safe.';
         next.resume_phase = 'hands_consulting';
@@ -710,6 +892,7 @@ async function recover() {
       next.recovery_required = false;
       next.resume_phase = 'hands_consulting';
       next.execution_lease_id = null;
+      next.block_kind = null;
       next.revision_consumed = false;
       next.execution_claimed = false;
       next.execution_started_at = null;
@@ -725,12 +908,18 @@ async function resume() {
       }
       if (next.recovery_required) throw new Error('Recovery is required. Inspect the working tree and run recover before resume.');
       const target = next.resume_phase || 'planning';
+      if (next.phase === 'blocked_user' && ['needs_revision', 'escalation'].includes(next.block_kind)) {
+        throw new Error('This blocker needs a revision. Use bridge revise "your answer" before resuming.');
+      }
       assertTransition(next.phase, target);
       next.phase = target;
       next.active_agent = target === 'blocked_user' || target === 'paused'
         ? 'user'
-        : (target.startsWith('brain_') || target === 'planning' ? 'mind' : 'hands');
-      next.blocked_reason = null;
+        : (target.startsWith('brain_') || target === 'planning' ? 'mind' : (target === 'hands_consulting' ? 'hands-consult' : 'hands'));
+      if (target !== 'blocked_user') {
+        next.blocked_reason = null;
+        next.block_kind = null;
+      }
       next.activity = { agent: next.active_agent, action: 'Resumed', started_at: now() };
       next.resume_phase = null;
     });
@@ -763,7 +952,9 @@ async function finish(summary) {
 
 async function cancel(summary) {
     return mutate('session_cancelled', summary || 'User cancelled the session', next => {
-      if (next.phase === 'done' || next.phase === 'cancelled') return;
+      if (next.phase === 'done' || next.phase === 'cancelled') {
+        throw new Error('Stop is unavailable while the session is ' + next.phase + '.');
+      }
       if (next.phase === 'hands_executing') {
         throw new Error('Stop is unavailable while HANDS is executing. Wait for the current chunk to finish.');
       }
@@ -808,8 +999,12 @@ async function unlock() {
     console.log('No coordinator lock found.');
     return;
   }
-  if (owner.pid && processAlive(Number(owner.pid))) {
-    throw new Error('Coordinator lock belongs to live process ' + owner.pid + '; refusing to remove it.');
+  const pid = owner && Number(owner.pid);
+  if (Number.isInteger(pid) && pid > 0 && processAlive(pid)) {
+    throw new Error('Coordinator lock belongs to live process ' + pid + '; refusing to remove it.');
+  }
+  if (!(await staleLock(lockFile))) {
+    throw new Error('Coordinator lock is not stale yet; refusing to remove it.');
   }
   await fs.unlink(lockFile).catch(error => {
     if (error.code !== 'ENOENT') throw error;
@@ -828,7 +1023,9 @@ function help() {
     '  bind-session <id>           Store HANDS provider session for continuation',
     '  activity <agent> <action>   Internal live activity update',
     '  claim-execution <lease-id>  Claim the single-use execution lease',
-    '  approve [summary]            Approve the current approach',
+    '  approve [summary]            Legacy manual approval',
+    '  brain-approve [summary]      Internal automatic Brain approval',
+    '  evaluate <json>              Record read-only HANDS evaluation',
     '  revise [summary]             Request a revised approach',
     '  complete [lease-id] <summary> Report HANDS chunk complete',
     '  block <reason>               Stop and wait for the user',
@@ -857,10 +1054,24 @@ async function main() {
     case 'activity': result = await setActivity(args.shift(), args.join(' ')); break;
     case 'claim-execution': result = await claimExecution(args[0]); break;
     case 'approve': result = await approve(args.join(' ')); break;
+    case 'brain-approve':
+    case 'approve-auto': result = await brainApprove(args.join(' ')); break;
+    case 'evaluate':
+    case 'evaluation': result = await recordEvaluation(args.join(' ')); break;
     case 'consult': result = await approveConsultation(args.join(' ')); break;
     case 'revise': result = await revise(args.join(' ')); break;
+    case 'continue': result = await continueChunk(args.join(' ')); break;
     case 'complete': result = await complete(args); break;
-    case 'block': result = await block(args.join(' ')); break;
+    case 'block': {
+      const marker = args.indexOf('--kind');
+      const kind = marker >= 0 ? args[marker + 1] : null;
+      if (marker >= 0) {
+        if (!kind) throw new Error('--kind requires a value.');
+        args.splice(marker, 2);
+      }
+      result = await block(args.join(' '), kind);
+      break;
+    }
     case 'recover': result = await recover(); break;
     case 'resume': result = await resume(); break;
     case 'pause': result = await pause(); break;
@@ -877,4 +1088,3 @@ main().catch(error => {
   console.error('Error: ' + error.message);
   process.exitCode = 1;
 });
-

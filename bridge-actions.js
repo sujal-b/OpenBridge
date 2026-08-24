@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 
+const { renameWithRetry } = require('./bridge-atomic');
 const MAX_FIELD_LENGTH = 240;
 const MAX_ID_LENGTH = 120;
 const DEFAULT_LOCK_WAIT_MS = 10000;
@@ -140,7 +141,7 @@ async function nextSequence(cwd) {
   const temp = sequenceFile(cwd) + '.' + process.pid + '.' + crypto.randomBytes(4).toString('hex') + '.tmp';
   try {
     await fs.writeFile(temp, String(next + 1) + '\n', 'utf8');
-    await fs.rename(temp, sequenceFile(cwd));
+    await renameWithRetry(temp, sequenceFile(cwd));
     return next;
   } finally {
     await fs.unlink(temp).catch(error => {
