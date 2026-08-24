@@ -31,6 +31,16 @@ test('runProcess terminates timed-out children', async () => {
   assert.equal(result.timed_out, true);
 });
 
+test('runProcess timeout settles even when telemetry callback hangs', async () => {
+  const started = Date.now();
+  const result = await runProcess(node, js("process.stdout.write(JSON.stringify({type:'step_start'}) + String.fromCharCode(10)); setTimeout(() => {}, 5000)"), {
+    timeoutMs: 50,
+    callbackTimeoutMs: 100,
+    onEvent: async () => new Promise(() => {})
+  });
+  assert.equal(result.timed_out, true);
+  assert.ok(Date.now() - started < 1500);
+});
 test('runProcess rejects spawn failures', async () => {
   await assert.rejects(() => runProcess('mind-limb-command-that-does-not-exist', []), /ENOENT|not found/i);
 });
@@ -93,4 +103,12 @@ test('argv builders keep prompts and paths as separate safe arguments', () => {
   assert.deepEqual(hands, ['run', '--agent', 'hands', '--format', 'json', '--model', 'provider/model', '--session', 'h-1', '--dir', cwd, prompt]);
   assert.equal(codex.includes('cmd.exe'), false);
   assert.equal(hands.includes('cmd.exe'), false);
+});
+test('parser recovers from malformed prose and extracts nested session IDs', () => {
+  const proposal = { decision: 'propose', summary: 'Recovered proposal', sessionID: 'recovered-session-1' };
+  const malformed = 'Comment { unfinished before ' + JSON.stringify(proposal);
+  assert.deepEqual(parseStructuredResult(malformed), proposal);
+  assert.equal(extractSessionId(malformed), 'recovered-session-1');
+  const nestedSession = JSON.stringify({ type: 'text', part: { text: JSON.stringify({ sessionID: 'nested-session-1' }) } });
+  assert.equal(extractSessionId(nestedSession), 'nested-session-1');
 });

@@ -98,7 +98,7 @@ test('long session preserves ordered state through 40 sequential chunks', async 
     run(cwd, ['init']);
     for (let index = 1; index <= 40; index += 1) {
       run(cwd, [index === 1 ? 'start' : 'start', 'Chunk ' + index]);
-      run(cwd, ['approach', 'Approach for chunk ' + index, '--files', 'app.txt']);
+      run(cwd, ['approach', 'Approach for chunk ' + index, '--files', 'app.txt', '--manual']);
       run(cwd, ['approve']);
       await advanceConsultation(cwd);
       await completeChunk(cwd, 'Completed chunk ' + index);
@@ -139,7 +139,7 @@ test('duplicate and stale actions are rejected without replaying work', async ()
   const cwd = await workspace();
   try {
     run(cwd, ['start', 'Replay protection']);
-    run(cwd, ['approach', 'First proposal', '--files', 'app.txt']);
+    run(cwd, ['approach', 'First proposal', '--files', 'app.txt', '--manual']);
     run(cwd, ['approve']);
     await advanceConsultation(cwd);
     const approved = await readState(cwd);
@@ -162,7 +162,7 @@ test('Git checkpoint detects changes after an approved execution', async () => {
   try {
     run(cwd, ['init']);
     run(cwd, ['start', 'Git checkpoint']);
-    run(cwd, ['approach', 'Change app.txt', '--files', 'app.txt']);
+    run(cwd, ['approach', 'Change app.txt', '--files', 'app.txt', '--manual']);
     run(cwd, ['approve']);
     await advanceConsultation(cwd);
     const before = await readState(cwd);
@@ -187,6 +187,8 @@ test('stale lock recovery is explicit and never automatic', async () => {
     const blocked = run(cwd, ['start', 'Must not run under stale lock'], 1);
     assert.match(blocked.stderr, /Another coordinator command is active/);
     assert.equal((await readState(cwd)).phase, 'idle');
+    const old = new Date(Date.now() - 60000);
+    await fs.utimes(lock, old, old);
     run(cwd, ['unlock']);
     run(cwd, ['start', 'Runs after explicit unlock']);
     assert.equal((await readState(cwd)).phase, 'planning');

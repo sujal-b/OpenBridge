@@ -5,25 +5,31 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const { runProcess } = require('./bridge-adapter');
 
-const CONTROL_PHASES = Object.freeze({
-  approve: ['brain_approving'],
-  revise: ['brain_approving'],
-  done: ['brain_reviewing'],
-  pause: ['planning', 'hands_proposing', 'brain_approving', 'brain_reviewing', 'blocked_user'],
-  resume: ['paused', 'blocked_user'],
-  stop: ['idle', 'planning', 'hands_proposing', 'brain_approving', 'brain_reviewing', 'blocked_user', 'paused'],
-  recover: ['hands_executing']
-});
-
-const CONTROL_COMMANDS = new Set(Object.keys(CONTROL_PHASES));
+const CONTROL_COMMANDS = new Set(['approve', 'revise', 'done', 'pause', 'resume', 'stop', 'recover']);
+const SESSION_PHASES = new Set([
+  'idle', 'planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'hands_executing', 'brain_reviewing', 'blocked_user', 'paused', 'done', 'cancelled'
+]);
 const root = __dirname;
 
-function controlAllowed(action, phase) {
-  return Boolean(CONTROL_PHASES[action] && CONTROL_PHASES[action].includes(phase));
+function allowedControls(state) {
+  if (!state || typeof state !== 'object') return [];
+  const { phase, recovery_required: recoveryRequired, resume_phase: resumePhase, block_kind: blockKind } = state;
+  if (!SESSION_PHASES.has(phase)) return [];
+  const autonomous = ['brain_autonomous', 'brain_approved'].includes(state.autonomy?.mode);
+  const consultationRetry = phase === 'blocked_user' && blockKind === 'consultation_retry';
+  return [
+    phase === 'brain_approving' && !autonomous && 'approve',
+    ((phase === 'brain_approving' || phase === 'brain_reviewing') ? !autonomous : (phase === 'blocked_user' && !recoveryRequired && !consultationRetry && ['planning', 'hands_proposing', 'hands_consulting'].includes(resumePhase))) && 'revise',
+    phase === 'brain_reviewing' && !autonomous && 'done',
+    ['planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'brain_reviewing', 'blocked_user'].includes(phase) && 'pause',
+    ['paused', 'blocked_user'].includes(phase) && !recoveryRequired && !['needs_revision', 'escalation'].includes(blockKind) && 'resume',
+    !['hands_executing', 'done', 'cancelled'].includes(phase) && 'stop',
+    (phase === 'hands_executing' || (phase === 'blocked_user' && recoveryRequired)) && 'recover'
+  ].filter(Boolean);
 }
 
-function allowedControls(phase) {
-  return Object.keys(CONTROL_PHASES).filter(action => controlAllowed(action, phase));
+function controlAllowed(action, state) {
+  return allowedControls(state).includes(action);
 }
 
 function sourcePath(projectRoot, name) {
@@ -101,12 +107,17 @@ async function readSnapshot(projectRoot = process.cwd()) {
   if (eventsSource.truncated) warnings.push({ source: 'events.jsonl', type: 'truncated', message: 'Showing the newest events only.' });
   if (actionsSource.truncated) warnings.push({ source: 'actions.jsonl', type: 'truncated', message: 'Showing the newest actions only.' });
   if (!eventsSource.available) warnings.push({ source: 'events.jsonl', type: 'missing', message: eventsSource.error });
-  if (!actionsSource.available) warnings.push({ source: 'actions.jsonl', type: 'missing', message: actionsSource.error });
+  const lastErrorEvent = [...events.values].reverse().find(e => e.type === 'session_blocked' || e.type === 'action_failed' || e.status === 'error' || e.error);
+  const error = (state && (state.error || state.block_reason))
+    || (state && state.phase === 'blocked_user' && state.last_summary)
+    || (lastErrorEvent ? (lastErrorEvent.error || lastErrorEvent.summary || lastErrorEvent.reason) : null);
 
   return {
     project: cwd,
     generated_at: new Date().toISOString(),
     state,
+    error: error || null,
+    controls: allowedControls(state),
     events: events.values,
     actions: actions.values,
     warnings,
@@ -124,7 +135,9 @@ function snapshotKey(snapshot) {
     return { length: values.length, seq: last.seq ?? null, id: last.id ?? null, at: last.at ?? null };
   };
   return JSON.stringify({
-    state: snapshot.state && { updated_at: snapshot.state.updated_at, event_seq: snapshot.state.event_seq, phase: snapshot.state.phase },
+    state: snapshot.state && { updated_at: snapshot.state.updated_at, event_seq: snapshot.state.event_seq, phase: snapshot.state.phase, block_reason: snapshot.state.block_reason, error: snapshot.state.error },
+    error: snapshot.error,
+    controls: snapshot.controls,
     events: signature(snapshot.events),
     actions: signature(snapshot.actions),
     warnings: snapshot.warnings,
@@ -266,7 +279,7 @@ function createInspectorServer(options = {}) {
         error.statusCode = 409;
         throw error;
       }
-      if (!controlAllowed(action, phase)) {
+      if (!controlAllowed(action, snapshot.state)) {
         const error = new Error(action + ' is unavailable while the session is ' + phase + '.');
         error.statusCode = 409;
         throw error;
@@ -393,7 +406,6 @@ async function startInspectorServer(options = {}) {
 }
 
 module.exports = {
-  CONTROL_PHASES,
   allowedControls,
   controlAllowed,
   createInspectorServer,

@@ -58,6 +58,7 @@
     .diff h3 { font-size:.72rem; color:var(--muted); margin-bottom:5px; }
     .notice { margin-bottom:16px; padding:11px 13px; border:1px solid #725c24; color:var(--yellow); background:#3b301522; border-radius:10px; display:none; }
     .notice.show { display:block; }
+    .notice.danger { border-color:#d32f2f; color:#ff8585; background:#4a121244; font-weight:600; }
     @media (max-width:900px) { .hero,.layout { grid-template-columns:1fr; } .stats { grid-template-columns:repeat(2,1fr); } }
     @media (max-width:560px) { .event { grid-template-columns:1fr auto; } .event-time { grid-column:1/-1; } .diff { grid-template-columns:1fr; } }
   </style>
@@ -97,16 +98,7 @@
   <script>
     const $ = selector => document.querySelector(selector);
     const state = { snapshot: null, selected: null, source: null };
-    const phaseControls = {
-      idle: ['stop'],
-      brain_approving: ['approve','revise','pause','stop'],
-      paused: ['resume','stop'],
-      blocked_user: ['resume','stop'],
-      hands_executing: ['recover'],
-      planning: ['pause','stop'],
-      hands_proposing: ['pause','stop'],
-      brain_reviewing: ['done','pause','stop']
-    };
+
     function text(value, fallback = '-') { return value === undefined || value === null || value === '' ? fallback : String(value); }
     function setText(selector, value, fallback) { $(selector).textContent = text(value, fallback); }
     function safeDate(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '-' : date.toLocaleTimeString(); }
@@ -125,15 +117,18 @@
       setText('#agent', current.active_agent, 'IDLE');
       setText('#task', current.task, 'No active task');
       setText('#approval', current.approval);
-      setText('#now', current.activity && current.activity.action || current.last_summary);
+      const errMsg = snapshot.error || (current.phase === 'blocked_user' && (current.block_reason || current.last_summary));
+      setText('#now', errMsg ? 'Blocked: ' + errMsg : (current.activity && current.activity.action || current.last_summary));
       setText('#git', current.git_status);
       setText('#counts', String((snapshot.events || []).length) + ' lifecycle / ' + String((snapshot.actions || []).length) + ' actions');
       setText('#updated', 'Updated ' + safeDate(snapshot.generated_at));
       const phase = String(current.phase || '').toLowerCase();
       $('#phase').className = phase === 'blocked_user' ? 'danger' : phase === 'done' ? 'good' : 'normal';
-      const allowed = phaseControls[phase] || [];
+      const allowed = Array.isArray(snapshot.controls) ? snapshot.controls : [];
       document.querySelectorAll('[data-control]').forEach(button => { button.disabled = !allowed.includes(button.dataset.control); });
-      if (snapshot.warnings && snapshot.warnings.length) showNotice(snapshot.warnings.map(item => item.message).join(' ')); else hideNotice();
+      if (errMsg) showNotice('⚠️ ' + errMsg, true);
+      else if (snapshot.warnings && snapshot.warnings.length) showNotice(snapshot.warnings.map(item => item.message).join(' '));
+      else hideNotice();
     }
     function renderTimeline(snapshot) {
       const timeline = $('#timeline'); timeline.replaceChildren();
@@ -161,8 +156,8 @@
       if (event.detail_ref) { const ref=document.createElement('pre'); ref.textContent='Details: ' + event.detail_ref; detail.append(ref); }
       if (event.before !== undefined || event.after !== undefined) { const diff=document.createElement('div'); diff.className='diff'; for (const part of [['Before',event.before],['After',event.after]]) { const box=document.createElement('div'); const h=document.createElement('h3'); h.textContent=part[0]; const pre=document.createElement('pre'); pre.textContent=text(part[1]); box.append(h,pre); diff.append(box); } detail.append(diff); }
     }
-    function showNotice(message) { const node=$('#notice'); node.textContent=message; node.classList.add('show'); }
-    function hideNotice() { $('#notice').classList.remove('show'); }
+    function showNotice(message, isError = false) { const node=$('#notice'); node.textContent=message; node.className = 'notice show' + (isError ? ' danger' : ''); }
+    function hideNotice() { const node=$('#notice'); node.className = 'notice'; }
     function apply(snapshot) { if (!snapshot) return; window.__bridgeSnapshot=snapshot; window.dispatchEvent(new CustomEvent('bridge-snapshot',{detail:snapshot})); state.snapshot=snapshot; renderSummary(snapshot); renderTimeline(snapshot); }
     async function sendControl(action) { const payload={action}; if (action === 'approve' || action === 'revise' || action === 'done') payload.summary=window.prompt(action === 'approve' ? 'Approval note' : action === 'done' ? 'Completion note' : 'Revision request') || ''; try { const response=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const value=await response.json(); if (!response.ok) throw new Error(value.error || 'Control failed'); apply(value.snapshot); showNotice(action + ' completed.'); } catch(error) { showNotice(error.message); } }
     document.querySelectorAll('[data-control]').forEach(button => button.addEventListener('click', () => sendControl(button.dataset.control)));

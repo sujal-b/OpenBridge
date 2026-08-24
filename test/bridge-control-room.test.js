@@ -97,3 +97,11 @@ test('inspector serves the live Control Room asset from the same local server', 
     await fs.rm(cwd, { recursive: true, force: true });
   }
 });
+test('Control Room clients consume server controls', async () => {
+  const html = await readInspector();
+  const script = await fs.readFile(path.join(__dirname, '..', 'inspector-control-room.js'), 'utf8');
+  assert.match(html, /snapshot\.controls/);
+  assert.match(script, /snapshot\.controls/);
+  assert.doesNotMatch(html, /phaseControls/);
+  assert.doesNotMatch(script, /function phaseControls/);
+});

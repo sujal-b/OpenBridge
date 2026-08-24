@@ -5,7 +5,12 @@ const os = require('node:os');
 const path = require('node:path');
 const { runProcess } = require('../bridge-adapter');
 const { spawnSync } = require('node:child_process');
-const { runAgent, proposalPrompt, executionPrompt, start, resume, revise, approve, invokeAgent, invokeAgentWithRetry, AgentBusyError } = require('../bridge-runner');
+const { runAgent, proposalPrompt, proposalReviewPrompt, consultationPrompt, evaluationPrompt, resultReviewPrompt, executionPrompt, start: startRunner, resume: resumeRunner, revise: reviseRunner, approve, reviewProposal, invokeAgent, invokeAgentWithRetry, unlockAgent, AgentBusyError } = require('../bridge-runner');
+
+// Legacy contract tests keep the explicit manual path; autonomous defaults are covered separately.
+const start = (task, options = {}) => startRunner(task, { ...options, autonomous: false, manual: true });
+const resume = (options = {}) => resumeRunner({ ...options, autonomous: false, manual: true });
+const revise = (summary, options = {}) => reviseRunner(summary, { ...options, autonomous: false, manual: true });
 
 const coordinator = path.resolve(__dirname, '..', 'bridge-coordinator.js');
 
@@ -61,6 +66,7 @@ test('proposal prompt is explicitly read-only and structured', () => {
   assert.match(prompt, /do not edit/i);
   assert.match(prompt, /decision/);
   assert.match(prompt, /Add validation/);
+  assert.match(prompt, /sensible defaults.*assumptions/i);
 });
 
 test('execution prompt includes only the approved approach', () => {
@@ -72,6 +78,7 @@ test('execution prompt includes only the approved approach', () => {
   assert.match(prompt, /Validate before saving/);
   assert.match(prompt, /src\/save\.js/);
   assert.match(prompt, /do not start another bridge session/i);
+  assert.match(prompt, /first non-whitespace character must be \{/i);
 });
 
 test('runAgent accepts a structured proposal from a mocked provider', async () => {
@@ -272,26 +279,117 @@ test('oversized proposals stop before Brain approval', async () => {
   }
 });
 
-test('Brain answers are carried into a revised proposal', async () => {
+test('proposal assumptions do not hard-block a complete proposal', async () => {
   const cwd = await createGitWorkspace('');
   let providerCalls = 0;
-  const prompts = [];
   const mockedProcess = async (command, args, options) => {
     if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
     providerCalls += 1;
-    prompts.push(args[args.length - 1]);
-    const result = providerCalls === 1
-      ? { decision: 'propose', summary: 'Choose an implementation style', files: ['README.md'], tests: ['read README'], questions: ['Should this favor minimal code or maximum performance?'], sessionID: 'hands-session-feedback' }
-      : { decision: 'propose', summary: 'Use the minimal implementation style', files: ['README.md'], tests: ['read README'], sessionID: 'hands-session-feedback' };
-    return { ok: true, code: 0, signal: null, stdout: JSON.stringify(result), stderr: '', timed_out: false };
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'propose', summary: 'Use the minimal implementation style', files: ['README.md'], tests: ['read README'], assumptions: ['Prefer the smallest implementation that meets the stated task.'], questions: ['Should this favor minimal code or maximum performance?'], sessionID: 'hands-session-feedback' }), stderr: '', timed_out: false };
   };
   try {
-    const blocked = await start('Choose an implementation style', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
-    assert.equal(blocked.state.phase, 'blocked_user');
-    const revised = await revise('Use minimal code with focused validation.', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
-    assert.equal(revised.state.phase, 'brain_approving');
-    assert.match(prompts[1], /Brain feedback or answers/);
-    assert.match(prompts[1], /Use minimal code/);
+    const proposed = await start('Choose an implementation style', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    assert.equal(proposed.state.phase, 'brain_approving');
+    assert.match(proposed.state.approach.summary, /Assumptions: Prefer the smallest implementation/);
+    assert.equal(proposed.state.blocked_reason, null);
+    assert.equal(providerCalls, 1);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+
+function proposalReviewState(sessionID = 'proposal-review-session') {
+  return {
+    task: 'Review a bounded proposal',
+    assignment_id: 'assignment-review',
+    revision: 0,
+    hands_session_id: sessionID,
+    approach: {
+      role: 'reliability engineer',
+      summary: 'A bounded, reviewable chunk.',
+      files: ['README.md']
+    }
+  };
+}
+
+test('proposal review accepts without ask_codex when validation is explicitly disabled', async () => {
+  const cwd = await createGitWorkspace('');
+  let calls = 0;
+  const mockedProcess = async () => {
+    calls += 1;
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'approved', summary: 'Safe bounded proposal' }), stderr: '', timed_out: false };
+  };
+  try {
+    const details = await reviewProposal(proposalReviewState('proposal-review-default'), { cwd, runProcess: mockedProcess, requireBrainEvent: false, retryAttempts: 2, retryDelayMs: 0 });
+    assert.equal(details.result.decision, 'approved');
+    assert.equal(calls, 1);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+test('proposal review retries missing ask_codex proof with an explicit repair prompt', async () => {
+  const cwd = await createGitWorkspace('');
+  let calls = 0;
+  const prompts = [];
+  const mockedProcess = async (command, args, options) => {
+    calls += 1;
+    prompts.push(String(args.at(-1)));
+    if (calls === 2) {
+      await options.onEvent?.(
+        { type: 'tool.completed' },
+        JSON.stringify({ type: 'tool.completed', part: { name: 'ask_codex' } }),
+        'stdout'
+      );
+    }
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'approved', summary: 'Safe bounded proposal' }), stderr: '', timed_out: false };
+  };
+  try {
+    const details = await reviewProposal(proposalReviewState(), { cwd, runProcess: mockedProcess, requireBrainEvent: true, retryAttempts: 2, retryDelayMs: 0 });
+    assert.equal(details.result.decision, 'approved');
+    assert.equal(calls, 2);
+    assert.match(prompts[1], /omitted observable ask_codex evidence/i);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('proposal review escalates precisely after missing ask_codex proof exhausts retries', async () => {
+  const cwd = await createGitWorkspace('');
+  let calls = 0;
+  const mockedProcess = async () => {
+    calls += 1;
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'approved', summary: 'Safe bounded proposal' }), stderr: '', timed_out: false };
+  };
+  try {
+    await assert.rejects(
+      () => reviewProposal(proposalReviewState('proposal-review-exhausted'), { cwd, runProcess: mockedProcess, requireBrainEvent: true, retryAttempts: 2, retryDelayMs: 0 }),
+      error => error.code === 'brain_review_missing'
+        && /approval proof is missing/i.test(error.message)
+        && /after 2 attempts/i.test(error.message)
+    );
+    assert.equal(calls, 2);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('proposal review recognizes ask_codex in a nested raw provider event', async () => {
+  const cwd = await createGitWorkspace('');
+  let calls = 0;
+  const mockedProcess = async (command, args, options) => {
+    calls += 1;
+    await options.onEvent?.(
+      { type: 'tool.completed' },
+      JSON.stringify({ type: 'tool.completed', payload: { tool_name: 'ask_codex' } }),
+      'stdout'
+    );
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'approved', summary: 'Safe bounded proposal' }), stderr: '', timed_out: false };
+  };
+  try {
+    const details = await reviewProposal(proposalReviewState('proposal-review-nested'), { cwd, runProcess: mockedProcess, requireBrainEvent: true, retryAttempts: 2, retryDelayMs: 0 });
+    assert.equal(details.result.decision, 'approved');
+    assert.equal(calls, 1);
   } finally {
     await fs.rm(cwd, { recursive: true, force: true });
   }
@@ -368,6 +466,41 @@ test('timeout errors keep partial provider output bounded', async () => {
       && !error.message.includes('x'.repeat(1000))
   );
 });
+test('invalid proposal output retries with the configured fallback model', async () => {
+  const calls = [];
+  const mockedProcess = async (command, args) => {
+    calls.push(args);
+    if (calls.length === 1) {
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ sessionID: 'proposal-fallback-session', message: 'partial output' }), stderr: '', timed_out: false };
+    }
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'propose', summary: 'Fallback proposal', files: ['README.md'], tests: ['read README'] }), stderr: '', timed_out: false };
+  };
+  const details = await invokeAgentWithRetry('hands-propose', 'prompt', {
+    runProcess: mockedProcess,
+    retryAttempts: 2,
+    retryDelayMs: 0
+  });
+  assert.equal(details.result.decision, 'propose');
+  assert.deepEqual(calls[1].slice(calls[1].indexOf('--model'), calls[1].indexOf('--model') + 2), ['--model', 'opencode/big-pickle']);
+  assert.deepEqual(calls[1].slice(calls[1].indexOf('--session'), calls[1].indexOf('--session') + 2), ['--session', 'proposal-fallback-session']);
+});
+
+ test('recent malformed agent locks are protected and stale ones can be unlocked', async () => {
+  const cwd = await createGitWorkspace('');
+  const file = path.join(cwd, '.bridge', 'agent.lock');
+  try {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, '', 'utf8');
+    await assert.rejects(() => unlockAgent({ cwd }), /invalid|too recent|stale/i);
+    const old = new Date(Date.now() - 60000);
+    await fs.utimes(file, old, old);
+    const result = await unlockAgent({ cwd });
+    assert.equal(result.unlocked, true);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('provider retry is bounded and reuses a discovered session', async () => {
   let calls = 0;
   const mockedProcess = async (command, args) => {
@@ -432,6 +565,237 @@ test('resume is idempotent when a previous resume already left planning active',
     const result = await resume({ cwd, runProcess: mockedProcess, retryDelayMs: 0 });
     assert.equal(result.state.phase, 'brain_approving');
     assert.equal(providerCalls, 1);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+test('proposal blockers preserve their question and require revision', async () => {
+  const cwd = await createGitWorkspace('');
+  let providerCalls = 0;
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    providerCalls += 1;
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'blocked', question: 'Which storage backend is required?', context: 'The selected backend changes the public API.', sessionID: 'hands-session-blocked' }), stderr: '', timed_out: false };
+  };
+  try {
+    const blocked = await start('Add persistent storage', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    assert.equal(blocked.state.phase, 'blocked_user');
+    assert.equal(blocked.state.block_kind, 'needs_revision');
+    assert.match(blocked.state.blocked_reason, /Which storage backend is required\?/);
+    const resumed = await resume({ cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    assert.equal(resumed.state.phase, 'blocked_user');
+    assert.match(resumed.error, /bridge revise/i);
+    assert.equal(providerCalls, 1);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('consultation blocks material Brain divergence before execution', async () => {
+  const cwd = await createGitWorkspace('');
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    await markBrainConsultation(args, options);
+    const output = args[2] === 'hands-propose'
+      ? { decision: 'propose', summary: 'Add focused validation', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-divergence' }
+      : { decision: 'blocked', question: 'Brain requires an API redesign before this chunk.', context: 'That is outside the approved scope.', sessionID: 'hands-session-divergence' };
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify(output), stderr: '', timed_out: false };
+  };
+  try {
+    await start('Add validation', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    const blocked = await approve('Approve focused validation', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    assert.equal(blocked.state.phase, 'blocked_user');
+    assert.equal(blocked.state.block_kind, 'needs_revision');
+    assert.match(blocked.state.blocked_reason, /API redesign/);
+    assert.match(consultationPrompt({ task: 'Add validation', assignment_id: 'assignment', revision: 0, approach: { summary: 'Add focused validation', files: ['src/app.js'] } }), /materially changes.*return decision blocked/i);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('malformed retry preserves the provider session and requests JSON repair', async () => {
+  const cwd = await createGitWorkspace('');
+  let providerCalls = 0;
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    providerCalls += 1;
+    if (providerCalls === 1) return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ sessionID: 'retry-session-1', part: { text: 'not a decision' } }), stderr: '', timed_out: false };
+    assert.deepEqual(args.slice(args.indexOf('--session'), args.indexOf('--session') + 2), ['--session', 'retry-session-1']);
+    assert.match(args.at(-1), /previous response was unusable/i);
+    return { ok: true, code: 0, signal: null, stdout: 'still not a decision', stderr: '', timed_out: false };
+  };
+  try {
+    const result = await start('Recover malformed provider output', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    assert.equal(result.state.phase, 'blocked_user');
+    assert.equal(result.state.hands_session_id, 'retry-session-1');
+    assert.equal(providerCalls, 2);
+  } finally { await fs.rm(cwd, { recursive: true, force: true }); }
+});
+test('transient ask_codex tool failures retry in the existing HANDS session', async () => {
+  const cwd = await createGitWorkspace('');
+  let consultationCalls = 0;
+  const sessions = [];
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    if (args[2] === 'hands-propose') {
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'propose', summary: 'Add focused validation', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-transient' }), stderr: '', timed_out: false };
+    }
+    if (args[2] === 'hands-consult') {
+      consultationCalls += 1;
+      sessions.push(args.slice(args.indexOf('--session'), args.indexOf('--session') + 2));
+      if (consultationCalls === 1) {
+        return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'blocked', question: 'ask_codex MCP tool spawn failed', context: 'Temporary tool startup failure.', sessionID: 'hands-session-transient' }), stderr: '', timed_out: false };
+      }
+      await markBrainConsultation(args, options);
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify(consultationFor(args, 'hands-session-transient')), stderr: '', timed_out: false };
+    }
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'completed', summary: 'Validation added', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-transient' }), stderr: '', timed_out: false };
+  };
+  try {
+    await start('Add validation', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    const completed = await approve('Approve focused validation', { cwd, runProcess: mockedProcess, retryAttempts: 2, retryDelayMs: 0 });
+    assert.equal(completed.state.phase, 'brain_reviewing');
+    assert.equal(consultationCalls, 2);
+    assert.deepEqual(sessions, [['--session', 'hands-session-transient'], ['--session', 'hands-session-transient']]);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('exhausted transient consultation failures resume in the existing HANDS session', async () => {
+  const cwd = await createGitWorkspace('');
+  let consultationCalls = 0;
+  const sessions = [];
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    if (args[2] === 'hands-propose') {
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'propose', summary: 'Add focused validation', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-resumable-consult' }), stderr: '', timed_out: false };
+    }
+    if (args[2] === 'hands-consult') {
+      consultationCalls += 1;
+      sessions.push(args.slice(args.indexOf('--session'), args.indexOf('--session') + 2));
+      if (consultationCalls === 1) {
+        return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'blocked', transient: true, question: 'ask_codex is temporarily unavailable', context: 'MCP tool startup error.', sessionID: 'hands-session-resumable-consult' }), stderr: '', timed_out: false };
+      }
+      await markBrainConsultation(args, options);
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify(consultationFor(args, 'hands-session-resumable-consult')), stderr: '', timed_out: false };
+    }
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'completed', summary: 'Validation added', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-resumable-consult' }), stderr: '', timed_out: false };
+  };
+  try {
+    await start('Add validation', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    const blocked = await approve('Approve focused validation', { cwd, runProcess: mockedProcess, retryAttempts: 1, retryDelayMs: 0 });
+    assert.equal(blocked.state.phase, 'blocked_user');
+    assert.equal(blocked.state.block_kind, 'consultation_retry');
+    assert.equal(blocked.state.resume_phase, 'hands_consulting');
+    const resumed = await resume({ cwd, runProcess: mockedProcess, retryAttempts: 1, retryDelayMs: 0 });
+    assert.equal(resumed.state.phase, 'brain_reviewing');
+    assert.equal(consultationCalls, 2);
+    assert.deepEqual(sessions, [['--session', 'hands-session-resumable-consult'], ['--session', 'hands-session-resumable-consult']]);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+test('exhausted provider timeouts during consultation block for a consult retry', async () => {
+  const cwd = await createGitWorkspace('');
+  let consultationCalls = 0;
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    if (args[2] === 'hands-propose') {
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'propose', summary: 'Add focused validation', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-provider-timeout' }), stderr: '', timed_out: false };
+    }
+    if (args[2] === 'hands-consult') {
+      consultationCalls += 1;
+      return { ok: false, code: null, signal: 'SIGTERM', stdout: '', stderr: '', timed_out: true };
+    }
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'completed', summary: 'Validation added', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-provider-timeout' }), stderr: '', timed_out: false };
+  };
+  try {
+    await start('Add validation', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    const blocked = await approve('Approve focused validation', { cwd, runProcess: mockedProcess, retryAttempts: 2, retryDelayMs: 0 });
+    assert.equal(blocked.state.phase, 'blocked_user');
+    assert.equal(blocked.state.block_kind, 'consultation_retry');
+    assert.equal(blocked.state.resume_phase, 'hands_consulting');
+    assert.match(blocked.error, /timeout/i);
+    assert.equal(consultationCalls, 2);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+test('resume migrates a raw legacy transient consultation block before rejecting revisions', async () => {
+  const cwd = await createGitWorkspace('');
+  let consultationCalls = 0;
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    if (args[2] === 'hands-consult') {
+      consultationCalls += 1;
+      await markBrainConsultation(args, options);
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify(consultationFor(args, 'hands-session-legacy-consult')), stderr: '', timed_out: false };
+    }
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ decision: 'completed', summary: 'Validation added', files: ['src/app.js'], tests: ['node --test'], sessionID: 'hands-session-legacy-consult' }), stderr: '', timed_out: false };
+  };
+  try {
+    await runProcess(process.execPath, [coordinator, 'init'], { cwd });
+    await runProcess(process.execPath, [coordinator, 'start', 'Resume legacy consultation'], { cwd });
+    await runProcess(process.execPath, [coordinator, 'approach', 'Add focused validation', '--files', 'src/app.js', '--manual'], { cwd });
+    await runProcess(process.execPath, [coordinator, 'bind-session', 'hands-session-legacy-consult'], { cwd });
+    await runProcess(process.execPath, [coordinator, 'approve'], { cwd });
+    const stateFile = path.join(cwd, '.bridge', 'state.json');
+    const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    await fs.writeFile(stateFile, JSON.stringify({
+      ...state,
+      phase: 'blocked_user',
+      active_agent: 'user',
+      block_kind: 'needs_revision',
+      recovery_required: false,
+      resume_phase: 'hands_consulting',
+      blocked_reason: 'ask_codex MCP tool spawn failed. Temporary tool startup failure.'
+    }, null, 2) + '\n', 'utf8');
+
+    const resumed = await resume({ cwd, runProcess: mockedProcess, retryAttempts: 1, retryDelayMs: 0 });
+    assert.equal(resumed.state.phase, 'brain_reviewing');
+    assert.equal(consultationCalls, 1);
+    assert.equal(JSON.parse(await fs.readFile(stateFile, 'utf8')).block_kind, null);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+
+test('phase prompts use compact role-aware JSON protocols', () => {
+  const state = { task: 'Add validation', assignment_id: 'a1', revision: 1, approach: { summary: 'Small chunk', files: ['src/app.js'] } };
+  assert.match(proposalReviewPrompt(state), /Role: BRAIN-REVIEW/);
+  assert.match(proposalReviewPrompt(state), /"decision":"approved\\|revise\\|escalate"/);
+  assert.match(evaluationPrompt(state, { decision: 'completed' }), /Role: HANDS-EVALUATE/);
+  assert.match(resultReviewPrompt(state, { decision: 'completed' }, { decision: 'passed' }), /Role: BRAIN-RESULT-REVIEW/);
+});
+
+
+test('start defaults to Brain-first autonomous review and evaluation', async () => {
+  const cwd = await createGitWorkspace('');
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    const role = args[2];
+    const prompt = String(args.at(-1) || '');
+    if (role === 'hands-propose') return { ok: true, code: 0, stdout: JSON.stringify({ decision: 'propose', summary: 'Small autonomous chunk', files: ['README.md'], tests: ['read README'], sessionID: 'auto-session' }), stderr: '', timed_out: false };
+    if (role === 'hands-evaluate') return { ok: true, code: 0, stdout: JSON.stringify({ decision: 'passed', summary: 'Focused checks pass', tests: ['read README'] }), stderr: '', timed_out: false };
+    if (role === 'hands') return { ok: true, code: 0, stdout: JSON.stringify({ decision: 'completed', summary: 'Chunk complete', sessionID: 'auto-session' }), stderr: '', timed_out: false };
+    if (prompt.includes('proposal_review')) {
+      await options.onEvent?.({ type: 'tool.completed', tool: 'ask_codex' });
+      return { ok: true, code: 0, stdout: JSON.stringify({ decision: 'approved', summary: 'Safe bounded proposal' }), stderr: '', timed_out: false };
+    }
+    if (prompt.includes('result_review')) {
+      await options.onEvent?.({ type: 'tool.completed', tool: 'ask_codex' });
+      return { ok: true, code: 0, stdout: JSON.stringify({ decision: 'passed', summary: 'Result accepted' }), stderr: '', timed_out: false };
+    }
+    await options.onEvent?.({ type: 'tool.completed', tool: 'ask_codex' });
+    return { ok: true, code: 0, stdout: JSON.stringify(consultationFor(args, 'auto-session')), stderr: '', timed_out: false };
+  };
+  try {
+    const result = await startRunner('Autonomous chunk', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    assert.equal(result.state.phase, 'done');
+    assert.equal(result.state.autonomy.mode, 'brain_approved');
+    assert.equal(result.state.evaluation.status, 'passed');
   } finally {
     await fs.rm(cwd, { recursive: true, force: true });
   }

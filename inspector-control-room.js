@@ -86,8 +86,10 @@
   hook.replaceWith(root);
   document.head.append(css);
 
-  function waitingText(role, current) {
+  function waitingText(role, current, snapshot) {
     if (['done', 'cancelled'].includes(current.phase)) return 'Session ' + current.phase + '.';
+    const err = (snapshot && snapshot.error) || current.block_reason;
+    if (current.phase === 'blocked_user' && err) return 'Blocked: ' + err;
     if (roleOf({ agent: current.active_agent }) === role) return text(current.activity && current.activity.action || current.last_summary, 'Active');
     return role === 'mind' ? 'Idle · waiting for the current HANDS result.' : 'Idle · waiting for the next approved chunk.';
   }
@@ -96,11 +98,19 @@
     const current = state.snapshot && state.snapshot.state || {};
     const roleEntries = entries(state.snapshot || {}).filter(event => event.role === role).slice(-4);
     const active = roleOf({ agent: current.active_agent }) === role;
+    const isBlocked = current.phase === 'blocked_user' && active;
+    const card = root.querySelector('.control-room-card.' + role);
+    if (card) {
+      if (isBlocked) card.style.borderColor = '#d32f2f';
+      else card.style.borderColor = '';
+    }
     const status = root.querySelector('[data-role-state="' + role + '"]');
     const currentNode = root.querySelector('[data-role-current="' + role + '"]');
     const target = root.querySelector('[data-role-events="' + role + '"]');
-    status.textContent = active ? text(current.phase, 'ACTIVE') : 'IDLE';
-    currentNode.textContent = waitingText(role, current);
+    status.textContent = active ? (isBlocked ? 'BLOCKED' : text(current.phase, 'ACTIVE')) : 'IDLE';
+    if (isBlocked) status.style.color = '#ff7d8d';
+    else status.style.color = '';
+    currentNode.textContent = waitingText(role, current, state.snapshot);
     target.replaceChildren();
     if (!roleEntries.length) {
       target.append(element('p', 'control-room-empty', 'No ' + (role === 'mind' ? 'MIND' : 'HANDS') + ' activity yet.'));
@@ -129,18 +139,6 @@
     });
   }
 
-  function phaseControls(phase) {
-    return {
-      idle: ['stop'],
-      planning: ['pause', 'stop'],
-      hands_proposing: ['pause', 'stop'],
-      brain_approving: ['approve', 'revise', 'pause', 'stop'],
-      brain_reviewing: ['done', 'pause', 'stop'],
-      hands_executing: ['recover'],
-      paused: ['resume', 'stop'],
-      blocked_user: ['resume', 'stop']
-    }[phase] || [];
-  }
 
   function setBusy(value) {
     state.busy = value;
@@ -151,7 +149,7 @@
   }
 
   function refreshControls() {
-    const allowed = phaseControls(state.snapshot && state.snapshot.state && state.snapshot.state.phase);
+    const allowed = Array.isArray(state.snapshot && state.snapshot.controls) ? state.snapshot.controls : [];
     document.querySelectorAll('[data-control]').forEach(button => {
       button.disabled = state.busy || !allowed.includes(button.dataset.control);
     });
