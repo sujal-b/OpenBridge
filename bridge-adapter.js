@@ -15,14 +15,20 @@ function resolveExecutable(command) {
   return candidates.find(candidate => fsSync.existsSync(candidate)) || command;
 }
 function terminateProcessTree(child) {
-  if (!child || !child.pid) return;
+  if (!child || !child.pid) return Promise.resolve();
   if (process.platform === 'win32') {
-    const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    killer.once('error', () => { try { child.kill(); } catch {} });
-    return;
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = () => { if (!settled) { settled = true; resolve(); } };
+      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+      killer.once('close', code => { if (code !== 0) { try { child.kill(); } catch {} } finish(); });
+      killer.once('error', () => { try { child.kill(); } catch {} finish(); });
+      setTimeout(finish, 2000).unref();
+    });
   }
   try { child.kill('SIGTERM'); } catch {}
   setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 1000).unref();
+  return Promise.resolve();
 }
 
 function runProcess(command, args = [], options = {}) {
@@ -35,6 +41,7 @@ function runProcess(command, args = [], options = {}) {
     let callbackChain = Promise.resolve();
     let timedOut = false;
     let settled = false;
+    let termination = Promise.resolve();
     const child = spawn(resolveExecutable(command), args, {
       cwd: options.cwd,
       env,
@@ -70,7 +77,14 @@ function runProcess(command, args = [], options = {}) {
     }
     const timer = setTimeout(() => {
       timedOut = true;
-      terminateProcessTree(child);
+      termination = terminateProcessTree(child);
+      const killGraceMs = Math.max(0, Number(options.killGraceMs ?? 500));
+      const grace = new Promise(resolveGrace => setTimeout(resolveGrace, killGraceMs));
+      Promise.race([termination, grace]).then(() => {
+        if (settled) return;
+        settled = true;
+        resolve({ ok: false, code: null, signal: 'SIGTERM', stdout, stderr, timed_out: true });
+      });
     }, timeoutMs);
 
     child.stdout?.on('data', chunk => {
@@ -93,7 +107,13 @@ function runProcess(command, args = [], options = {}) {
       if (settled) return;
       consumeLines('stdout', '', true);
       consumeLines('stderr', '', true);
-      callbackChain.then(() => {
+      const callbackTimeoutMs = Math.max(0, Number(options.callbackTimeoutMs ?? 1000));
+      let callbackTimer;
+      const callbackDeadline = new Promise(resolveCallback => {
+        callbackTimer = setTimeout(resolveCallback, callbackTimeoutMs);
+      });
+      Promise.allSettled([termination, Promise.race([callbackChain, callbackDeadline])]).then(() => {
+        clearTimeout(callbackTimer);
         if (settled) return;
         settled = true;
         resolve({
@@ -145,7 +165,14 @@ function balancedJsonFragments(text) {
       inString = true;
       continue;
     }
-    if (character === '{' || character === '[') {
+    if (character === '{' && depth === 0) {
+      const next = source.slice(index + 1).match(/\S/)?.[0];
+      // A prose brace cannot start a JSON object; ignore it so it cannot hide
+      // a later structured decision.
+      if (next !== '"' && next !== '}') continue;
+      start = index;
+      depth += 1;
+    } else if (character === '{' || character === '[') {
       if (depth === 0) start = index;
       depth += 1;
     } else if (character === '}' || character === ']') {
@@ -156,6 +183,18 @@ function balancedJsonFragments(text) {
         start = -1;
       }
     }
+  }
+  return fragments;
+}
+
+function decisionJsonFragments(text) {
+  const source = String(text);
+  const fragments = [];
+  const pattern = /\{\s*"decision"\s*:/g;
+  let match;
+  while ((match = pattern.exec(source))) {
+    const fragment = balancedJsonFragments(source.slice(match.index))[0];
+    if (fragment) fragments.push(fragment);
   }
   return fragments;
 }
@@ -186,6 +225,10 @@ function parseTextResult(text) {
     } catch {
       // Keep scanning other fragments.
     }
+  }
+  for (const fragment of decisionJsonFragments(source).reverse()) {
+    const result = parseJsonResult(fragment);
+    if (result) return result;
   }
   return null;
 }
@@ -238,28 +281,46 @@ function parseStructuredResult(text) {
 
 
 function extractSessionId(text) {
+  const source = String(text);
   let found = null;
-  for (const line of String(text).split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
-    try {
-      const parsed = JSON.parse(line);
-      const visit = value => {
-        if (!value || typeof value !== 'object') return;
-        if (Array.isArray(value)) {
-          for (const item of value) visit(item);
-          return;
-        }
-        for (const key of ['sessionID', 'sessionId', 'session_id']) {
-          if (typeof value[key] === 'string' && value[key].trim()) found = value[key].trim();
-        }
-        for (const child of Object.values(value)) visit(child);
-      };
-      visit(parsed);
-    } catch {
-      // Ignore non-JSON provider lines.
+  const state = { nodes: 0, maxNodes: 500, maxStringLength: 2 * 1024 * 1024 };
+  const visit = value => {
+    if (state.nodes >= state.maxNodes || value === null || value === undefined) return;
+    state.nodes += 1;
+    if (typeof value === 'string') {
+      const candidate = value.trim();
+      if (!candidate || candidate.length > state.maxStringLength) return;
+      try {
+        visit(JSON.parse(candidate));
+        return;
+      } catch {}
+      for (const fragment of balancedJsonFragments(candidate)) {
+        try { visit(JSON.parse(fragment)); } catch {}
+      }
+      return;
     }
+    if (typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item);
+      return;
+    }
+    for (const key of ['sessionID', 'sessionId', 'session_id']) {
+      const candidate = typeof value[key] === 'string' ? value[key].trim() : '';
+      if (candidate && !/^session-/i.test(candidate)) found = candidate;
+    }
+    for (const child of Object.values(value)) visit(child);
+  };
+  for (const line of source.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
+    try { visit(JSON.parse(line)); } catch { visit(line); }
+  }
+  try { visit(JSON.parse(source)); } catch {}
+  for (const fragment of decisionJsonFragments(source)) {
+    try { visit(JSON.parse(fragment)); } catch {}
   }
   return found;
-}function buildCodexArgs(prompt, options = {}) {
+}
+
+function buildCodexArgs(prompt, options = {}) {
   if (!prompt) throw new Error('Codex prompt is required.');
   const args = ['exec'];
   if (options.sessionId) args.push('resume', String(options.sessionId));
