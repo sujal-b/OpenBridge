@@ -2,6 +2,7 @@
 'use strict';
 
 const fs = require('node:fs/promises');
+const fsSync = require('node:fs');
 const os = require('node:os');
 const readline = require('node:readline');
 const path = require('node:path');
@@ -436,6 +437,26 @@ async function readJsonLines(cwd, name, limit = 120, maxBytes = 256 * 1024) {
   }
 }
 
+function processAlive(pid) {
+  if (!pid || typeof pid !== 'number') return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === 'EPERM';
+  }
+}
+
+async function readRunnerPid(cwd) {
+  try {
+    const raw = await fs.readFile(path.join(cwd, '.bridge', 'runner.pid'), 'utf8');
+    const pid = parseInt(raw.trim(), 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
 async function readEvents(cwd) { return readJsonLines(cwd, 'events.jsonl', 120); }
 async function readActions(cwd) { return readJsonLines(cwd, 'actions.jsonl', 160); }
 
@@ -536,7 +557,7 @@ function controlAllowed(command, state) {
   return allowedControls(state).includes(command);
 }
 
-function renderDashboard(state, events, cwd, actions = []) {
+function renderDashboard(state, events, cwd, actions = [], runnerAlive = true) {
   const cols = process.stdout.columns || 80;
   const rowsAvailable = process.stdout.rows || 24;
   const W = Math.max(40, cols - 2);
@@ -561,7 +582,7 @@ function renderDashboard(state, events, cwd, actions = []) {
   // ── Recent activity log ────────────────────────────────────────────────────
   const merged = [
     ...events.map(e => ({ at: e.at, agent: e.agent || e.active_agent || 'system', label: e.type, summary: e.summary || '' })),
-    ...actions.map(a => ({ at: a.at, agent: a.agent || 'system', label: a.kind, summary: a.summary || a.target || '' }))
+    ...actions.map(a => ({ at: a.at, agent: a.agent || 'system', label: a.kind, summary: a.path || a.summary || a.target || '' }))
   ].sort((a, b) => String(a.at).localeCompare(String(b.at))).slice(-activityLimit);
 
   const activityRows = merged.length
@@ -612,8 +633,11 @@ function renderDashboard(state, events, cwd, actions = []) {
     boxRow(ANSI.muted + 'EVAL  ' + ANSI.reset + evalColor + evalStatus + ANSI.reset + '   ' + ANSI.muted + 'GIT ' + ANSI.reset + shorten(state.git_status || '—', W - 32), W)
   );
 
-  // Blocked reason
-  if (state.blocked_reason) {
+  // Blocked reason / Runner stopped alert
+  if (isActive && runnerAlive === false) {
+    rows.push(boxDiv(W));
+    rows.push(boxRow(ANSI.error + ANSI.bold + '⚠ RUNNER STOPPED  ' + ANSI.reset + ANSI.warn + 'Background worker exited. Check .bridge/runner.log' + ANSI.reset, W));
+  } else if (state.blocked_reason) {
     rows.push(boxDiv(W));
     rows.push(boxRow(ANSI.warn + '⚠  ' + shorten(state.blocked_reason, W - 8) + ANSI.reset, W));
   }
@@ -635,7 +659,7 @@ async function watch(cwd) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('bridge watch needs an interactive terminal.');
   let closed = false;
   let busy = false;
-  let frameLines = 0;
+  let steerActive = false;
   let timer;
   let notice = '';
   let rendering = false;
@@ -645,27 +669,26 @@ async function watch(cwd) {
     try {
       let output;
       try {
-        output = renderDashboard(await readState(cwd), await readEvents(cwd), cwd, await readActions(cwd));
+        const state = await readState(cwd);
+        const events = await readEvents(cwd);
+        const actions = await readActions(cwd);
+        let runnerAlive = true;
+        if (ACTIVE_PHASES.has(state.phase)) {
+          const pid = await readRunnerPid(cwd);
+          if (pid) runnerAlive = processAlive(pid);
+        }
+        output = renderDashboard(state, events, cwd, actions, runnerAlive);
       } catch (error) {
         output = ANSI.error + '  No bridge session. Run: bridge open .' + ANSI.reset + '\n' + ANSI.muted + '  ' + error.message + ANSI.reset;
       }
       if (notice) output += '\n\n' + ANSI.warn + '  ' + shorten(notice, 100) + ANSI.reset;
-      if (frameLines) readline.moveCursor(process.stdout, 0, -frameLines);
-      readline.cursorTo(process.stdout, 0);
-      readline.clearScreenDown(process.stdout);
-      process.stdout.write(output + '\n');
-      frameLines = output.split('\n').length;
+      process.stdout.write('\x1b[H\x1b[2J' + output + '\n');
     } finally {
       rendering = false;
     }
   };
 
-  const onResize = () => {
-    frameLines = 0;
-    readline.cursorTo(process.stdout, 0);
-    readline.clearScreenDown(process.stdout);
-    render();
-  };
+  const onResize = () => render();
   process.stdout.on('resize', onResize);
 
   const cleanup = () => {
@@ -677,9 +700,7 @@ async function watch(cwd) {
       process.stdin.setRawMode(false);
       process.stdin.pause();
     }
-    readline.cursorTo(process.stdout, 0);
-    readline.clearScreenDown(process.stdout);
-    process.stdout.write(ANSI.reset + '\x1b[?25h\n');
+    process.stdout.write(ANSI.reset + '\x1b[?25h\x1b[?1049l');
   };
   const control = async command => {
     if (busy) return;
@@ -702,16 +723,19 @@ async function watch(cwd) {
     }
   };
   const promptSteer = () => {
-    if (busy) return;
+    if (steerActive || busy) return;
+    steerActive = true;
     busy = true;
     clearInterval(timer);
+    const rows = process.stdout.rows || 24;
+    // Position cursor at bottom of screen inside alternate buffer, show cursor
+    process.stdout.write('\x1b[' + (rows - 1) + ';0H\x1b[2K\x1b[?25h');
     if (process.stdin.isTTY) process.stdin.setRawMode(false);
-    process.stdout.write(ANSI.reset + '\x1b[?25h\n');
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const prompt = ANSI.bold + ANSI.primary + '  Steer prompt' + ANSI.reset + ANSI.muted + ' (inject guidance · Enter or Ctrl+C to cancel): ' + ANSI.reset;
+    const prompt = ANSI.bold + ANSI.primary + '  Steer' + ANSI.reset + ANSI.muted + ' (guidance · Enter submit · Ctrl+C cancel): ' + ANSI.reset;
 
     let closedPrompt = false;
-    const cancelPrompt = () => {
+    const done = (msg) => {
       if (closedPrompt) return;
       closedPrompt = true;
       rl.close();
@@ -720,41 +744,33 @@ async function watch(cwd) {
         process.stdin.resume();
       }
       process.stdout.write('\x1b[?25l');
-      notice = 'Steer cancelled.';
+      notice = msg;
+      steerActive = false;
       busy = false;
       timer = setInterval(render, 1000);
       render();
     };
 
-    rl.on('SIGINT', cancelPrompt);
+    rl.on('SIGINT', () => done('Steer cancelled.'));
 
     rl.question(prompt, async input => {
       if (closedPrompt) return;
-      closedPrompt = true;
-      rl.close();
-      if (process.stdin.isTTY) {
-        process.stdin.setRawMode(true);
-        process.stdin.resume();
-      }
-      process.stdout.write('\x1b[?25l');
       const text = (input || '').trim();
       if (text) {
         try {
           await invoke(runner, ['revise', text], cwd);
-          notice = 'Steered: ' + text;
+          done('Steered: ' + text);
         } catch (e) {
-          notice = 'Error steering: ' + e.message;
+          done('Error steering: ' + e.message);
         }
       } else {
-        notice = 'Steer cancelled.';
+        done('Steer cancelled.');
       }
-      busy = false;
-      timer = setInterval(render, 1000);
-      await render();
     });
   };
 
-  process.stdout.write('\x1b[?25l');
+  // Enter alternate screen, hide cursor, initial render
+  process.stdout.write('\x1b[?1049h\x1b[2J\x1b[H\x1b[?25l');
   await render();
   timer = setInterval(render, 1000);
   process.stdin.setRawMode(true);
@@ -921,13 +937,25 @@ function help() {
  * The runner writes progress to .bridge/state.json which watch() polls.
  */
 async function spawnRunner(runnerArgs, cwd) {
+  const bridgeDir = path.join(cwd, '.bridge');
+  await fs.mkdir(bridgeDir, { recursive: true });
+  const logPath = path.join(bridgeDir, 'runner.log');
+  const outFd = fsSync.openSync(logPath, 'a');
+  const now = new Date().toISOString();
+  fsSync.writeSync(outFd, '\n--- Runner started at ' + now + ' (args: ' + runnerArgs.join(' ') + ') ---\n');
   const child = spawn(process.execPath, [runner, ...runnerArgs], {
     cwd,
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', outFd, outFd],
     env: { ...process.env }
   });
+  const pid = child.pid;
+  if (pid) {
+    fsSync.writeSync(outFd, '--- Runner PID: ' + pid + ' ---\n');
+    await fs.writeFile(path.join(bridgeDir, 'runner.pid'), String(pid) + '\n', 'utf8').catch(() => {});
+  }
   child.unref();
+  fsSync.closeSync(outFd);
   // Brief wait so runner can begin initializing state before watch reads it
   await new Promise(resolve => setTimeout(resolve, 400));
 }

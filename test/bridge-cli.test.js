@@ -51,8 +51,9 @@ test('autonomous dashboard removes ordinary approval shortcut', () => {
 
 test('watch uses a single repainting terminal frame', async () => {
   const source = await fs.readFile(cli, 'utf8');
-  assert.match(source, /readline\.moveCursor/);
-  assert.match(source, /readline\.clearScreenDown/);
+  assert.match(source, /\\x1b\[\?1049h/);
+  assert.match(source, /\\x1b\[\?1049l/);
+  assert.match(source, /\\x1b\[H\\x1b\[2J/);
   assert.match(source, /MIND_LIMB_BRIDGE_TIMEOUT_MS/);
   assert.match(source, /controlsFor/);
   assert.match(source, /recover/);
@@ -174,6 +175,8 @@ test('bridge run resumes an interrupted autonomous result review', async () => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-review-cli-'));
   try {
     run(cwd, ['open', cwd]);
+    // Unknown provider forces brain_config_error -> fallback to mocked hands-consult (no network).
+    await fs.writeFile(path.join(cwd, '.bridge', 'brain.json'), JSON.stringify({ provider: '__test_noop__' }) + '\n', 'utf8');
     await fs.writeFile(path.join(cwd, 'run'), [
       "process.stdout.write(JSON.stringify({ type: 'tool.completed', tool: 'ask_codex' }) + String.fromCharCode(10));",
       "process.stdout.write(JSON.stringify({ decision: 'passed', summary: 'Focused checks pass' }) + String.fromCharCode(10));"

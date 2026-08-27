@@ -165,6 +165,9 @@ function providerEventRecord(event, context) {
     target: target || type,
     summary,
     status,
+    path: targetPath,
+    command,
+    query,
     duration_ms: scalar(event.duration_ms, event.durationMs, part.duration_ms, item.duration_ms),
     risk: classification.risk,
     approval: context.approval,
@@ -321,7 +324,10 @@ async function acquireAgentLock(options = {}, agent = 'hands') {
     await handle.close();
   } catch (error) {
     if (error.code === 'EEXIST') {
-      throw new AgentBusyError('Another HANDS provider call is active. Wait for it to finish; use "unlock-agent" only after a crash.');
+      const owner = await readLockOwner(file);
+      const err = new AgentBusyError('Another HANDS provider call is active. Wait for it to finish; use "unlock-agent" only after a crash.');
+      if (await staleAgentLock(file, owner)) err.stale = true;
+      throw err;
     }
     throw error;
   }
@@ -964,11 +970,17 @@ async function autoAdvance(proposed, options = {}) {
       outcome = await propose({ ...options, autonomous: false });
       continue;
     }
-    const approvalSummary = textOf(review, 'Brain approved the HANDS proposal automatically.');
-    await autoApprove(state, { ...options, summary: approvalSummary });
-    const consulted = await consult({ ...options, autonomous: false });
-    if (consulted.state?.phase !== 'hands_executing') return consulted;
-    return execute({ ...options, autonomous: options.autonomous !== false, _autoRevisionCount: revisions, _autoChunkCount: Number(options._autoChunkCount || 0) + 1 });
+    try {
+      const approvalSummary = textOf(review, 'Brain approved the HANDS proposal automatically.');
+      await autoApprove(state, { ...options, summary: approvalSummary });
+      const consulted = await consult({ ...options, autonomous: false });
+      if (consulted.state?.phase !== 'hands_executing') return consulted;
+      return execute({ ...options, autonomous: options.autonomous !== false, _autoRevisionCount: revisions, _autoChunkCount: Number(options._autoChunkCount || 0) + 1 });
+    } catch (error) {
+      if (error.code === 'agent_busy') throw error;
+      const reason = error.message;
+      return { state: await blockForUser(reason, options, 'escalation'), error: reason };
+    }
   }
   return outcome;
 }
@@ -1265,7 +1277,7 @@ async function start(task, options = {}) {
     if (state.task && state.task !== task) {
       throw new Error('A different task is already active. Finish or stop it before starting another task.');
     }
-    const proposed = await propose({ ...options, autonomous: false });
+    const proposed = await safePropose(options);
     return options.autonomous === false ? proposed : autoAdvance(proposed, options);
   }
   if (state.phase === 'hands_consulting') {
@@ -1278,8 +1290,19 @@ async function start(task, options = {}) {
     throw new Error('The current task is ' + state.phase + '. Finish or resume it before starting another task.');
   }
   await runCommand(['start', task], options);
-  const proposed = await propose({ ...options, autonomous: false });
+  const proposed = await safePropose(options);
   return options.autonomous === false ? proposed : autoAdvance(proposed, options);
+}
+
+async function safePropose(options) {
+  try {
+    return await propose({ ...options, autonomous: false });
+  } catch (error) {
+    if (error.code === 'agent_busy' && error.stale) {
+      return { state: await blockForUser(error.message, options), error: error.message };
+    }
+    throw error;
+  }
 }
 async function resume(options = {}) {
   const current = await readState(options);
@@ -1296,7 +1319,7 @@ async function resume(options = {}) {
     };
   }
   if (['planning', 'hands_proposing'].includes(current.phase)) {
-    const proposed = await propose({ ...options, autonomous: false });
+    const proposed = await safePropose(options);
     return options.autonomous === false ? proposed : autoAdvance(proposed, options);
   }
   if (current.phase === 'brain_approving') {
@@ -1314,7 +1337,7 @@ async function resume(options = {}) {
   }
   const resumed = await runCommand(['resume'], options);
   if (['planning', 'hands_proposing'].includes(resumed.phase)) {
-    const proposed = await propose({ ...options, autonomous: false });
+    const proposed = await safePropose(options);
     return options.autonomous === false ? proposed : autoAdvance(proposed, options);
   }
   if (resumed.phase === 'brain_approving') {

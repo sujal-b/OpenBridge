@@ -136,7 +136,7 @@ stale-lock cleanup.
 - `.bridge/state.json` is the authoritative state.
 - `.bridge/state.json.corrupt-*` keeps a repaired corrupt snapshot for up to 7 days.
 - `.bridge/events.jsonl` is the lifecycle overview log.
-- `.bridge/actions.jsonl` records bounded provider/tool summaries; secrets are redacted.
+- `.bridge/actions.jsonl` records bounded provider/tool summaries with target path, op, and command; secrets are redacted.
 - `.bridge/policy.json` stores safe defaults and project overrides.
 - `.bridge/agent.lock` prevents parallel HANDS calls.
 - The HANDS session ID is preserved across chunks.
