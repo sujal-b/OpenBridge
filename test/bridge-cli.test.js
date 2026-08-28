@@ -8,6 +8,7 @@ const { spawnSync } = require('node:child_process');
 const cli = path.resolve(__dirname, '..', 'bridge.js');
 const coordinator = path.resolve(__dirname, '..', 'bridge-coordinator.js');
 const { controlsFor, controlAllowed } = require('../bridge');
+const { computeMaxRunTimeoutMs } = require('../bridge-adapter');
 
 function git(cwd, args, expected = 0) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -57,6 +58,24 @@ test('watch uses a single repainting terminal frame', async () => {
   assert.match(source, /MIND_LIMB_BRIDGE_TIMEOUT_MS/);
   assert.match(source, /controlsFor/);
   assert.match(source, /recover/);
+});
+
+test('outer bridge kill timeout covers every runner timeout variable plus headroom', () => {
+  assert.equal(computeMaxRunTimeoutMs({}), 630000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_EXECUTION_TIMEOUT_MS: '1200000' }), 1230000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_PROPOSAL_TIMEOUT_MS: '900000' }), 930000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_CONSULT_TIMEOUT_MS: '900000' }), 930000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_AGENT_TIMEOUT_MS: '900000' }), 930000);
+  assert.equal(
+    computeMaxRunTimeoutMs({ MIND_LIMB_AGENT_TIMEOUT_MS: '900000', MIND_LIMB_EXECUTION_TIMEOUT_MS: '60000' }),
+    930000,
+    'a high AGENT_TIMEOUT alone must raise the wrapper kill above the execution default'
+  );
+});
+
+test('bridge wrapper timeout: explicit 0 or unset falls back to the computed runner maximum', async () => {
+  const source = await fs.readFile(cli, 'utf8');
+  assert.match(source, /MIND_LIMB_BRIDGE_TIMEOUT_MS\)\s*\|\|\s*computeMaxRunTimeoutMs\(process\.env\)/);
 });
 
 

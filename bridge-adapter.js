@@ -359,4 +359,21 @@ function buildOpencodeArgs(prompt, options = {}) {
   return args;
 }
 
-module.exports = { runProcess, resolveExecutable, parseStructuredResult, extractSessionId, buildCodexArgs, buildOpencodeArgs };
+const RUNNER_TIMEOUT_DEFAULTS_MS = {
+  MIND_LIMB_EXECUTION_TIMEOUT_MS: 600000,
+  MIND_LIMB_PROPOSAL_TIMEOUT_MS: 180000,
+  MIND_LIMB_CONSULT_TIMEOUT_MS: 300000
+};
+
+function computeMaxRunTimeoutMs(env = process.env) {
+  const shared = Number(env.MIND_LIMB_AGENT_TIMEOUT_MS);
+  const sharedMs = Number.isFinite(shared) && shared > 0 ? shared : null;
+  const effective = Object.keys(RUNNER_TIMEOUT_DEFAULTS_MS).map(name => {
+    if (sharedMs !== null) return sharedMs;
+    const parsed = Number(env[name]);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : RUNNER_TIMEOUT_DEFAULTS_MS[name];
+  });
+  return Math.max(...effective) + 30000;
+}
+
+module.exports = { runProcess, resolveExecutable, parseStructuredResult, extractSessionId, buildCodexArgs, buildOpencodeArgs, computeMaxRunTimeoutMs };

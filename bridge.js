@@ -7,7 +7,7 @@ const os = require('node:os');
 const readline = require('node:readline');
 const path = require('node:path');
 const { spawn } = require('node:child_process');
-const { runProcess } = require('./bridge-adapter');
+const { runProcess, computeMaxRunTimeoutMs } = require('./bridge-adapter');
 const { startInspectorServer, allowedControls } = require('./bridge-inspector');
 
 const bridgeRoot = __dirname;
@@ -216,7 +216,7 @@ function projectPath(args) {
 async function invoke(script, args, cwd) {
   const timeoutMs = script === runner
     ? Number(process.env.MIND_LIMB_BRIDGE_TIMEOUT_MS)
-      || ((Number(process.env.MIND_LIMB_EXECUTION_TIMEOUT_MS) || 600000) + 30000)
+      || computeMaxRunTimeoutMs(process.env)
     : 30000;
   const result = await runProcess(process.execPath, [script, ...args], { cwd, timeoutMs });
   if (!result.ok) {

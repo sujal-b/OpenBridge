@@ -24,6 +24,8 @@ const initLockFile = path.join(bridgeDir, 'init.lock');
 const lockFile = path.join(bridgeDir, 'state.lock');
 const commitFile = path.join(bridgeDir, 'commit.pending.json');
 
+let stateLockDepth = 0;
+
 const phases = new Set([
   'idle', 'planning', 'hands_proposing', 'brain_approving',
   'hands_consulting', 'hands_executing', 'brain_reviewing', 'blocked_user', 'paused',
@@ -319,6 +321,34 @@ async function reinitializeState() {
   return state;
 }
 
+async function repairPlan(raw) {
+  const normalized = normalizeState(raw);
+  const repairedSeq = coerceEventSeq(raw) === null;
+  if (repairedSeq) {
+    const eventInfo = await lastEvent(root);
+    if (eventInfo.seq >= 0) normalized.event_seq = eventInfo.seq;
+  }
+  const needsRepair = repairedSeq || (raw.block_kind === 'needs_revision' && normalized.block_kind === 'consultation_retry');
+  return { normalized, needsRepair };
+}
+
+async function repairStateUnderLock() {
+  let lock;
+  try { lock = await acquireLock(); } catch (error) {
+    if (error.code === 'coordinator_busy') return;
+    throw error;
+  }
+  try {
+    await reconcilePending();
+    let raw;
+    try { raw = JSON.parse(await fs.readFile(stateFile, 'utf8')); } catch { return; }
+    const { normalized, needsRepair } = await repairPlan(raw);
+    if (needsRepair) await writeJsonAtomic(stateFile, normalized);
+  } finally {
+    await releaseLock(lock);
+  }
+}
+
 async function readState() {
   await ensureStore();
   // Keep corrupt snapshots for diagnosis briefly, then remove old repair litter.
@@ -334,19 +364,25 @@ async function readState() {
     raw = JSON.parse(await fs.readFile(stateFile, 'utf8'));
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
-    await fs.rename(stateFile, stateFile + '.corrupt-' + Date.now().toString(36)).catch(unlinkError => {
-      if (unlinkError.code !== 'ENOENT') throw unlinkError;
-    });
+    const quarantineFile = stateFile + '.corrupt-' + Date.now().toString(36);
+    try {
+      await renameWithRetry(stateFile, quarantineFile);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        await fs.copyFile(stateFile, quarantineFile).catch(copyError => {
+          if (copyError.code !== 'ENOENT') throw copyError;
+        });
+        await fs.unlink(stateFile).catch(unlinkError => {
+          if (unlinkError.code !== 'ENOENT') throw unlinkError;
+        });
+      }
+    }
     raw = await reinitializeState();
   }
-  const normalized = normalizeState(raw);
-  const repairedSeq = coerceEventSeq(raw) === null;
-  if (repairedSeq) {
-    const eventInfo = await lastEvent(root);
-    if (eventInfo.seq >= 0) normalized.event_seq = eventInfo.seq;
-  }
-  if (repairedSeq || raw.block_kind === 'needs_revision' && normalized.block_kind === 'consultation_retry') {
-    await writeJsonAtomic(stateFile, normalized);
+  const { normalized, needsRepair } = await repairPlan(raw);
+  if (needsRepair) {
+    if (stateLockDepth > 0) await writeJsonAtomic(stateFile, normalized);
+    else await repairStateUnderLock();
   }
   return normalized;
 }
@@ -389,9 +425,11 @@ async function withLock(action) {
   await fs.mkdir(bridgeDir, { recursive: true });
   await ensureStore();
   const lock = await acquireLock();
+  stateLockDepth += 1;
   try {
     return await action();
   } finally {
+    stateLockDepth -= 1;
     await releaseLock(lock);
   }
 }

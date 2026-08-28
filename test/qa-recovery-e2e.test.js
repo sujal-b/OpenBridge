@@ -674,6 +674,45 @@ test('corruption: hostile event_seq "NaN" must be coerced to a number so continu
   }
 });
 
+test('repair: unlocked status repair persists under lock and never loses a subsequent committed transition', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'qa-repair-lock-'));
+  const stateFile = path.join(cwd, '.bridge', 'state.json');
+  const eventsFile = path.join(cwd, '.bridge', 'events.jsonl');
+  const run = args => {
+    const result = spawnSync(process.execPath, [coordinator, ...args], { cwd, encoding: 'utf8' });
+    assert.equal(result.status, 0, 'coordinator ' + args.join(' ') + ' failed: ' + result.stderr);
+    return result;
+  };
+  try {
+    run(['init']);
+    run(['start', 'QA repair under lock']);
+    const before = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    before.event_seq = 'NaN';
+    await fs.writeFile(stateFile, JSON.stringify(before), 'utf8');
+    run(['status']);
+    const repaired = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    assert.equal(typeof repaired.event_seq, 'number', 'unlocked status must persist the seq repair');
+    assert.equal(repaired.task, 'QA repair under lock', 'repair must not lose the committed task');
+    assert.equal(repaired.phase, 'planning', 'repair must not lose the committed phase');
+    run(['activity', 'mind', 'post-repair pulse']);
+    const after = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    assert.equal(after.task, 'QA repair under lock', 'committed transition after repair must survive');
+    assert.equal(after.phase, 'planning', 'committed transition after repair must survive');
+    assert.equal(after.event_seq, repaired.event_seq + 1, 'the post-repair commit must advance the sequence');
+    const seqs = (await fs.readFile(eventsFile, 'utf8')).trim().split(/\r?\n/).filter(Boolean)
+      .map(line => JSON.parse(line).seq);
+    assert.equal(seqs.at(-1), after.event_seq, 'audit log must agree with the post-repair state');
+    for (let i = 1; i < seqs.length; i += 1) {
+      assert.equal(seqs[i], seqs[i - 1] + 1, 'event sequence must stay contiguous across the repair');
+    }
+    const bridgeEntries = await fs.readdir(path.join(cwd, '.bridge'));
+    assert.ok(!bridgeEntries.includes('state.lock'), 'repair must release the state lock');
+    assert.ok(!bridgeEntries.includes('commit.pending.json'), 'repair must not leave a pending commit');
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('corruption: hostile block_kind 123 is tolerated by the dashboard and resume self-heals to done', async () => {
   const cwd = await createGitWorkspace('qa-corrupt-kind-');
   const provider = makeProvider(cwd);
