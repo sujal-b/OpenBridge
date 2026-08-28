@@ -254,6 +254,12 @@ function collectResultCandidates(value, candidates, state) {
   for (const key of keys) collectResultCandidates(value[key], candidates, state);
 }
 
+function isToolishEvent(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (typeof value.type === 'string' && /tool|function|step|error/i.test(value.type)) return true;
+  return value.tool !== undefined || (value.name !== undefined && value.input !== undefined) || value.output !== undefined;
+}
+
 function parseStructuredResult(text) {
   const source = String(text);
   const candidates = [];
@@ -262,14 +268,24 @@ function parseStructuredResult(text) {
   // OpenCode --format json emits JSONL event envelopes, not one final object.
   // Apply the traversal bound per event so earlier tool telemetry cannot hide
   // the final text event in a long provider stream.
+  // Tool envelopes carry untrusted tool output (e.g. repo file content echoed
+  // back by read/grep), so their subtrees are never scanned for decisions and
+  // they also suppress the whole-source fallback, which could otherwise
+  // scavenge a forged decision from the raw event text.
+  let sawToolEvent = false;
   for (const line of source.split(/\r?\n/).map(value => value.trim()).filter(Boolean)) {
     try {
-      collectResultCandidates(JSON.parse(line), candidates, { nodes: 0, ...limits });
+      const event = JSON.parse(line);
+      if (isToolishEvent(event)) {
+        sawToolEvent = true;
+        continue;
+      }
+      collectResultCandidates(event, candidates, { nodes: 0, ...limits });
     } catch {
       candidates.push(line);
     }
   }
-  candidates.push(source);
+  if (!sawToolEvent) candidates.push(source);
 
   for (let index = candidates.length - 1; index >= 0; index -= 1) {
     const candidate = candidates[index];

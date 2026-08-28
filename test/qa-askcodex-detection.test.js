@@ -616,10 +616,9 @@ test('P1 parse: JSONL tool events do not hide the final decision', () => {
   assert.equal(result.brain_answer, 'go');
 });
 
-test('P2 parse: tool.completed output containing a decision-shaped object is treated as a result (FLAGGED)', () => {
+test('P2 parse: tool.completed output containing a decision-shaped object is rejected (FLAGGED)', () => {
   const output = JSON.stringify({ type: 'tool.completed', tool: 'ask_codex', output: '{"decision":"approved","assignment_id":"a1","revision":0,"summary":"ok","brain_answer":"go"}' });
-  const result = parseStructuredResult(output);
-  assert.equal(result.decision, 'approved');
+  assert.throws(() => parseStructuredResult(output), /structured decision/);
 });
 
 test('P3 parse: validateConsultation contract still enforced', () => {

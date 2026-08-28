@@ -312,6 +312,19 @@ test('recent malformed coordinator locks are protected until stale', async () =>
     await assert.rejects(() => fs.access(lock));
   });
 });
+test('dead-pid coordinator lock is stolen automatically instead of wedging commands', async () => {
+  await withWorkspace(async workspace => {
+    run(workspace, ['init']);
+    const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
+    assert.equal(dead.status, 0);
+    const lock = path.join(workspace, '.bridge', 'state.lock');
+    await fs.writeFile(lock, JSON.stringify({ pid: dead.pid, token: 'crashed', at: new Date().toISOString() }) + '\n', 'utf8');
+    // Previously coordinator_busy forever; now the stale lock is stolen and the command proceeds.
+    run(workspace, ['start', 'Recovered task']);
+    assert.equal((await readState(workspace)).phase, 'planning');
+  });
+});
+
 test('events are ordered and plan.md follows state.json', async () => {
   await withWorkspace(async workspace => {
     run(workspace, ['start', 'Audit test']);

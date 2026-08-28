@@ -210,7 +210,7 @@ async function reconcilePending() {
 }
 
 async function reconcilePendingIfSafe() {
-  if (!(await exists(commitFile)) || (await exists(lockFile))) return;
+  if (!(await exists(commitFile))) return;
   let lock;
   try { lock = await acquireLock(); } catch (error) {
     if (error.code === 'coordinator_busy') return;
@@ -359,12 +359,20 @@ async function acquireLock() {
     await handle.close();
     return { file: lockFile, token };
   } catch (error) {
-    if (error.code === 'EEXIST') {
-      const busy = new Error('Another coordinator command is active. Inspect ' + lockFile + ', then run "unlock" only if it is stale.');
-      busy.code = 'coordinator_busy';
-      throw busy;
+    if (error.code !== 'EEXIST') throw error;
+    const owner = await readLockOwner(lockFile);
+    const pid = owner && Number(owner.pid);
+    const validPid = Number.isInteger(pid) && pid > 0;
+    const stale = validPid ? !processAlive(pid) : await staleLock(lockFile);
+    if (stale) {
+      await fs.unlink(lockFile).catch(unlinkError => {
+        if (unlinkError.code !== 'ENOENT') throw unlinkError;
+      });
+      return acquireLock();
     }
-    throw error;
+    const busy = new Error('Another coordinator command is active. Inspect ' + lockFile + ', then run "unlock" only if it is stale.');
+    busy.code = 'coordinator_busy';
+    throw busy;
   }
 }
 

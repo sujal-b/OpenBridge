@@ -6,9 +6,10 @@ const { parseStructuredResult } = require('./bridge-adapter');
 
 const PROVIDERS = {
   gemini: {
-    endpoint: function(model, key) { return 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key; },
+    endpoint: function(model) { return 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent'; },
     buildBody: function(prompt) { return { contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.1, maxOutputTokens: 1024 } }; },
     extractText: function(data) { var c = data.candidates; return c && c[0] && c[0].content && c[0].content.parts && c[0].content.parts[0] ? c[0].content.parts[0].text || '' : ''; },
+    headers: function(key) { return { 'x-goog-api-key': key }; },
     defaultModel: 'gemini-2.0-flash'
   },
   openrouter: {
@@ -92,9 +93,18 @@ function httpPost(url, body, extraHeaders, timeoutMs) {
     var req = lib.request({ method: 'POST', hostname: urlObj.hostname, port: urlObj.port || (isHttp ? 80 : 443), path: urlObj.pathname + urlObj.search, headers: reqHeaders }, function(res) {
       var data = '';
       res.on('data', function(chunk) { data += chunk; });
+      res.on('error', function(err) {
+        clearTimeout(timer);
+        req.destroy();
+        reject(Object.assign(err, { code: err.code || 'brain_api_failed' }));
+      });
       res.on('end', () => {
+        clearTimeout(timer);
         if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(Object.assign(new Error('Brain API HTTP ' + res.statusCode + ': ' + data.slice(0, 300)), { code: 'brain_api_failed', statusCode: res.statusCode }));
+          var retryAfterMs = Number(res.headers['retry-after']);
+          var err = Object.assign(new Error('Brain API HTTP ' + res.statusCode + ': ' + data.slice(0, 300)), { code: 'brain_api_failed', statusCode: res.statusCode });
+          if (Number.isFinite(retryAfterMs) && retryAfterMs > 0) err.retryAfterMs = retryAfterMs * 1000;
+          reject(err);
         } else {
           try {
             var text = data.trim();
@@ -113,13 +123,28 @@ function httpPost(url, body, extraHeaders, timeoutMs) {
   });
 }
 
+async function httpPostWithRetry(url, body, extraHeaders, timeoutMs) {
+  const maxAttempts = 3;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await httpPost(url, body, extraHeaders, timeoutMs);
+    } catch (error) {
+      const retryable = error.code === 'brain_api_timeout' ||
+        (error.statusCode !== undefined && (error.statusCode === 429 || error.statusCode >= 500));
+      if (!retryable || attempt >= maxAttempts) throw error;
+      const backoffMs = Math.min(error.retryAfterMs || 1000 * Math.pow(2, attempt - 1), 30000);
+      await new Promise(resolve => setTimeout(resolve, backoffMs));
+    }
+  }
+}
+
 async function callBrain(prompt, options) {
   var resolved = resolveConfig(options);
   var spec = resolved.spec; var model = resolved.model; var apiKey = resolved.apiKey; var timeoutMs = resolved.timeoutMs;
   var url = typeof spec.endpoint === 'function' ? spec.endpoint(model, apiKey, resolved.config) : spec.endpoint;
   var body = spec.buildBody(prompt, model);
   var extraHeaders = typeof spec.headers === 'function' ? spec.headers(apiKey) : {};
-  var data = await httpPost(url, body, extraHeaders, timeoutMs);
+  var data = await httpPostWithRetry(url, body, extraHeaders, timeoutMs);
   return spec.extractText(data);
 }
 
@@ -151,8 +176,11 @@ async function brainConsultChunk(state, options) {
   ];
   var text = await callBrain(parts.join('\n'), options);
   var result = parseBrainJson(text);
-  if (!result || result.approved === false) {
-    var rc = Array.isArray(result && result.concerns) && result.concerns.length ? result.concerns.join('; ') : (result ? '' : text.slice(0, 300));
+  if (!result || result.approved !== true && result.approved !== false) {
+    throw Object.assign(new Error('Brain consult returned no valid decision: ' + text.slice(0, 300)), { code: 'brain_api_failed' });
+  }
+  if (result.approved === false) {
+    var rc = Array.isArray(result.concerns) && result.concerns.length ? result.concerns.join('; ') : '';
     throw Object.assign(new Error('Brain rejected the chunk' + (rc ? ': ' + rc : '.')), { code: 'brain_rejected', brainResult: result });
   }
   return { guidance: String(result.guidance || 'Proceed with the approved chunk as specified.').slice(0, 600), concerns: Array.isArray(result.concerns) ? result.concerns : [] };
