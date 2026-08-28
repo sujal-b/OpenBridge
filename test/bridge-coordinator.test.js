@@ -204,6 +204,20 @@ test('approval blocks a dirty Git tree', async () => {
   } finally { await fs.rm(workspace, { recursive: true, force: true }); }
 });
 
+test('approval rejects execution from a nested repository directory', async () => {
+  const workspace = await createCleanGitWorkspace();
+  const nested = path.join(workspace, 'nested');
+  try {
+    await fs.mkdir(nested);
+    run(nested, ['start', 'Nested directory test']);
+    run(nested, ['approach', 'Inspect only', '--files', 'notes.txt']);
+    const failure = run(nested, ['approve'], 1);
+    const state = await readState(nested);
+    assert.equal(state.phase, 'brain_approving');
+    assert.match(failure.stderr, /Git repository/);
+  } finally { await fs.rm(workspace, { recursive: true, force: true }); }
+});
+
 test('approval records the clean Git baseline', async () => {
   const workspace = await createCleanGitWorkspace();
   try {
