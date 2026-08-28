@@ -1,0 +1,25 @@
+{
+  "name": "mind-limb-bridge",
+  "version": "0.1.0",
+  "description": "A small local Brain (MIND/Codex) <-> HANDS (OpenCode) workflow with autonomous Brain handoffs, visibility, and one active agent at a time.",
+  "license": "MIT",
+  "main": "bridge.js",
+  "bin": {
+    "bridge": "./bridge.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "private": true,
+  "files": [
+    "bridge*.js",
+    "inspector*.js",
+    "inspector.html",
+    ".opencode/",
+    "README.md",
+    "LICENSE"
+  ]
+}
