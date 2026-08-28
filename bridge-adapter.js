@@ -14,21 +14,38 @@ function resolveExecutable(command) {
   ];
   return candidates.find(candidate => fsSync.existsSync(candidate)) || command;
 }
-function terminateProcessTree(child) {
-  if (!child || !child.pid) return Promise.resolve();
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function taskkillTree(pid, timeoutMs = 1500) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = ok => { if (!settled) { settled = true; resolve(ok); } };
+    const killer = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
+    killer.once('close', code => finish(code === 0));
+    killer.once('error', () => finish(false));
+    setTimeout(() => finish(false), timeoutMs).unref();
+  });
+}
+
+async function terminateProcessTree(child) {
+  if (!child || !child.pid) return true;
   if (process.platform === 'win32') {
-    return new Promise(resolve => {
-      let settled = false;
-      const finish = () => { if (!settled) { settled = true; resolve(); } };
-      const killer = spawn('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-      killer.once('close', code => { if (code !== 0) { try { child.kill(); } catch {} } finish(); });
-      killer.once('error', () => { try { child.kill(); } catch {} finish(); });
-      setTimeout(finish, 2000).unref();
-    });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (attempt) await delay(100);
+      if (await taskkillTree(child.pid)) return true;
+    }
+    try { return child.kill(); } catch { return false; }
   }
+  // ponytail: POSIX kills the direct child only; grandchildren survive until
+  // their own exit — a no-deps POSIX tree-kill (process-group scan) is out of scope.
   try { child.kill('SIGTERM'); } catch {}
-  setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 1000).unref();
-  return Promise.resolve();
+  await delay(1000);
+  if (child.exitCode === null && child.signalCode === null) {
+    try { child.kill('SIGKILL'); } catch {}
+  }
+  return true;
 }
 
 function runProcess(command, args = [], options = {}) {

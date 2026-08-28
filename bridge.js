@@ -6,6 +6,7 @@ const fsSync = require('node:fs');
 const os = require('node:os');
 const readline = require('node:readline');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { runProcess, computeMaxRunTimeoutMs } = require('./bridge-adapter');
 const { startInspectorServer, allowedControls } = require('./bridge-inspector');
@@ -449,12 +450,32 @@ function processAlive(pid) {
 
 async function readRunnerPid(cwd) {
   try {
-    const raw = await fs.readFile(path.join(cwd, '.bridge', 'runner.pid'), 'utf8');
-    const pid = parseInt(raw.trim(), 10);
+    const raw = (await fs.readFile(path.join(cwd, '.bridge', 'runner.pid'), 'utf8')).trim();
+    let parsed = null;
+    try { parsed = JSON.parse(raw); } catch {}
+    const pid = parsed ? Number(parsed.pid) : parseInt(raw, 10);
     return Number.isInteger(pid) && pid > 0 ? pid : null;
   } catch {
     return null;
   }
+}
+
+async function runnerIsAlive(cwd) {
+  const pid = await readRunnerPid(cwd);
+  if (!pid) return true;
+  if (!processAlive(pid)) return false;
+  // A recycled PID reports alive after the real runner is gone. A live runner
+  // moves state.json at least once per provider call, so an alive pid with both
+  // the pid file and the state file idle past the longest single provider call
+  // (computeMaxRunTimeoutMs: execution timeout + headroom) is a recycled pid.
+  const staleAfterMs = computeMaxRunTimeoutMs();
+  const age = async file => {
+    try { return Date.now() - (await fs.stat(file)).mtimeMs; } catch { return null; }
+  };
+  const pidAge = await age(path.join(cwd, '.bridge', 'runner.pid'));
+  const stateAge = await age(path.join(cwd, '.bridge', 'state.json'));
+  if (pidAge === null || stateAge === null) return true;
+  return !(pidAge > staleAfterMs && stateAge > staleAfterMs);
 }
 
 async function readEvents(cwd) { return readJsonLines(cwd, 'events.jsonl', 120); }
@@ -674,8 +695,7 @@ async function watch(cwd) {
         const actions = await readActions(cwd);
         let runnerAlive = true;
         if (ACTIVE_PHASES.has(state.phase)) {
-          const pid = await readRunnerPid(cwd);
-          if (pid) runnerAlive = processAlive(pid);
+          runnerAlive = await runnerIsAlive(cwd);
         }
         output = renderDashboard(state, events, cwd, actions, runnerAlive);
       } catch (error) {
@@ -952,7 +972,11 @@ async function spawnRunner(runnerArgs, cwd) {
   const pid = child.pid;
   if (pid) {
     fsSync.writeSync(outFd, '--- Runner PID: ' + pid + ' ---\n');
-    await fs.writeFile(path.join(bridgeDir, 'runner.pid'), String(pid) + '\n', 'utf8').catch(() => {});
+    await fs.writeFile(
+      path.join(bridgeDir, 'runner.pid'),
+      JSON.stringify({ pid, started_at: Date.now(), token: crypto.randomBytes(12).toString('hex') }) + '\n',
+      'utf8'
+    ).catch(() => {});
   }
   child.unref();
   fsSync.closeSync(outFd);
@@ -1095,4 +1119,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { readJsonLines, controlsFor, controlAllowed };
+module.exports = { readJsonLines, controlsFor, controlAllowed, runnerIsAlive };

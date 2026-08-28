@@ -69,13 +69,24 @@ async function enforcePolicyGate(actions, policy, options = {}) {
   return null;
 }
 
-async function recordTelemetry(event, options = {}) {
-  try {
-    return await appendAction(event, { cwd: options.cwd || root });
-  } catch {
-    // Observability must not block the coordinator or provider call.
-    return null;
-  }
+const TELEMETRY_MAX_IN_FLIGHT = 8;
+let telemetryInFlight = 0;
+let telemetryQueueTail = Promise.resolve();
+
+function recordTelemetry(event, options = {}) {
+  // ponytail: beyond 8 queued telemetry appends the event is dropped — losing
+  // one observability line beats stalling the provider hot path on the actions lock.
+  if (telemetryInFlight >= TELEMETRY_MAX_IN_FLIGHT) return Promise.resolve(null);
+  telemetryInFlight += 1;
+  const write = telemetryQueueTail
+    .then(() => appendAction(event, { cwd: options.cwd || root, lockWaitMs: 2000 }))
+    .catch(() => {
+      // Observability must not block the coordinator or provider call.
+      return null;
+    })
+    .finally(() => { telemetryInFlight -= 1; });
+  telemetryQueueTail = write.then(() => {}, () => {});
+  return write;
 }
 
 function scalar(...values) {

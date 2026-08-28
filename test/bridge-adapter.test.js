@@ -9,6 +9,23 @@ function js(code) {
   return ['-e', code];
 }
 
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+async function waitDead(pid, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && alive(pid)) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return !alive(pid);
+}
+
 test('runProcess captures successful stdout and stderr without a shell', async () => {
   const result = await runProcess(node, js("process.stdout.write('ok'); process.stderr.write('warn')"), { timeoutMs: 1000 });
   assert.equal(result.ok, true);
@@ -29,6 +46,25 @@ test('runProcess terminates timed-out children', async () => {
   const result = await runProcess(node, js('setTimeout(() => {}, 5000)'), { timeoutMs: 50 });
   assert.equal(result.ok, false);
   assert.equal(result.timed_out, true);
+});
+
+test('runProcess timeout kills the whole process tree, not just the direct child', async () => {
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    "const grandchild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });",
+    "process.stdout.write(JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }) + String.fromCharCode(10));",
+    "setTimeout(() => {}, 60000);"
+  ].join(' ');
+  const result = await runProcess(node, js(parent), { timeoutMs: 500 });
+  assert.equal(result.ok, false);
+  assert.equal(result.timed_out, true);
+  const ids = JSON.parse(result.stdout.trim().split(/\r?\n/)[0]);
+  assert.ok(ids.parent > 0);
+  assert.ok(ids.grandchild > 0);
+  assert.ok(await waitDead(ids.parent), 'direct child survived the timeout kill');
+  if (process.platform === 'win32') {
+    assert.ok(await waitDead(ids.grandchild), 'grandchild survived the timeout kill');
+  }
 });
 
 test('runProcess timeout settles even when telemetry callback hangs', async () => {

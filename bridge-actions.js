@@ -118,7 +118,9 @@ async function acquireLock(cwd, waitMs = DEFAULT_LOCK_WAIT_MS) {
         continue;
       }
       if (Date.now() - started >= waitMs) throw new Error('Timed out waiting for the telemetry action lock.');
-      await delay(4);
+      // ponytail: flat jitter, not exponential backoff — measured 3x slower under
+      // waiter queues because grown sleeps leave the freed lock idle.
+      await delay(3 + Math.floor(Math.random() * 6));
     }
   }
 }

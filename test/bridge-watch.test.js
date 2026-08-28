@@ -3,7 +3,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { readJsonLines, controlsFor, controlAllowed } = require('../bridge');
+const { spawnSync } = require('node:child_process');
+const { readJsonLines, controlsFor, controlAllowed, runnerIsAlive } = require('../bridge');
 
 test('bridge watch reads only a bounded tail of long JSONL logs', async () => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-watch-'));
@@ -40,4 +41,59 @@ test('bridge watch uses the shared control policy', () => {
   assert.doesNotMatch(controlsFor(consultationRetry), /bridge revise/);
   assert.equal(controlAllowed('resume', consultationRetry), true);
   assert.equal(controlAllowed('stop', { phase: 'hands_consulting' }), true);
+});
+
+test('runner liveness treats a fresh pid file as alive even for a long-lived pid', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-pid-fresh-'));
+  try {
+    await fs.mkdir(path.join(cwd, '.bridge'));
+    await fs.writeFile(path.join(cwd, '.bridge', 'runner.pid'), JSON.stringify({ pid: process.pid, started_at: Date.now(), token: 'deadbeef' }) + '\n');
+    await fs.writeFile(path.join(cwd, '.bridge', 'state.json'), JSON.stringify({ phase: 'hands_executing' }));
+    assert.equal(await runnerIsAlive(cwd), true);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('runner liveness detects a recycled pid when pid and state files are both idle', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-pid-stale-'));
+  try {
+    await fs.mkdir(path.join(cwd, '.bridge'));
+    const pidFile = path.join(cwd, '.bridge', 'runner.pid');
+    const stateFile = path.join(cwd, '.bridge', 'state.json');
+    await fs.writeFile(pidFile, JSON.stringify({ pid: process.pid, started_at: Date.now(), token: 'deadbeef' }) + '\n');
+    await fs.writeFile(stateFile, JSON.stringify({ phase: 'hands_executing' }));
+    const old = new Date(Date.now() - 7200000);
+    await fs.utimes(pidFile, old, old);
+    assert.equal(await runnerIsAlive(cwd), true);
+    await fs.utimes(stateFile, old, old);
+    assert.equal(await runnerIsAlive(cwd), false);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('runner liveness reports a dead pid as stopped', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-pid-dead-'));
+  try {
+    await fs.mkdir(path.join(cwd, '.bridge'));
+    const exited = spawnSync(process.execPath, ['-e', '']);
+    await fs.writeFile(path.join(cwd, '.bridge', 'runner.pid'), JSON.stringify({ pid: exited.pid, started_at: Date.now(), token: 'deadbeef' }) + '\n');
+    await fs.writeFile(path.join(cwd, '.bridge', 'state.json'), JSON.stringify({ phase: 'hands_executing' }));
+    assert.equal(await runnerIsAlive(cwd), false);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('runner liveness reads legacy bare-pid files', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-pid-legacy-'));
+  try {
+    await fs.mkdir(path.join(cwd, '.bridge'));
+    await fs.writeFile(path.join(cwd, '.bridge', 'runner.pid'), process.pid + '\n');
+    await fs.writeFile(path.join(cwd, '.bridge', 'state.json'), JSON.stringify({ phase: 'hands_executing' }));
+    assert.equal(await runnerIsAlive(cwd), true);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
 });
