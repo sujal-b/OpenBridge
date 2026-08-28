@@ -437,11 +437,9 @@ async function withLock(action) {
 async function gitSnapshot() {
   let isRepo = false;
   try {
-    const toplevel = await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd: root });
-    const topPath = path.resolve(toplevel.stdout.trim());
-    if (topPath.toLowerCase() !== path.resolve(root).toLowerCase()) {
-      return { isRepo: false, head: null, dirty: false, status: [] };
-    }
+    await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd: root });
+    const prefix = await execFileAsync('git', ['rev-parse', '--show-prefix'], { cwd: root });
+    if (prefix.stdout.trim()) return { isRepo: false, head: null, dirty: false, status: [] };
     isRepo = true;
   } catch {
     return { isRepo: false, head: null, dirty: false, status: [] };
