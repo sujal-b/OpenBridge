@@ -20,19 +20,21 @@ async function markBrainConsultation(args, options) {
   }
 }
 async function createGitWorkspace(prefix) {
-  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
-  await fs.writeFile(path.join(cwd, '.gitignore'), '.bridge/\n', 'utf8');
-  await fs.writeFile(path.join(cwd, 'README.md'), '# Test project\n', 'utf8');
-  const git = args => {
-    const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
-    assert.equal(result.status, 0, 'git ' + args.join(' ') + ' failed: ' + result.stderr);
-  };
-  git(['init', '-q']);
-  git(['config', 'user.email', 'runner@example.invalid']);
-  git(['config', 'user.name', 'Mind-Limb Runner']);
-  git(['add', '.']);
-  git(['commit', '-qm', 'baseline']);
-  return cwd;
+   const base = path.join(process.cwd(), '.tmp-test-workspaces');
+   await fs.mkdir(base, { recursive: true });
+   const cwd = await fs.mkdtemp(path.join(base, prefix || 'workspace-'));
+   await fs.writeFile(path.join(cwd, '.gitignore'), '.bridge/\n', 'utf8');
+   await fs.writeFile(path.join(cwd, 'README.md'), '# Test project\n', 'utf8');
+   const git = args => {
+     const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
+     assert.equal(result.status, 0, 'git ' + args.join(' ') + ' failed: ' + result.stderr);
+   };
+   git(['init', '-q']);
+   git(['config', 'user.email', 'runner@example.invalid']);
+   git(['config', 'user.name', 'Mind-Limb Runner']);
+   git(['add', '.']);
+   git(['commit', '-qm', 'baseline']);
+   return cwd;
 }
 
 function consultationFor(args, sessionID) {
