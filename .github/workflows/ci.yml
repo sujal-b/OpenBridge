@@ -11,7 +11,13 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: npm test
+       - uses: actions/setup-node@v4
+         with:
+           node-version: 22
+       - name: Initialize Git repository for coordinator tests
+         run: |
+           git config --global user.email "test@example.com"
+           git config --global user.name "Test User"
+           git add .
+           git commit -m "baseline" --allow-empty
+       - run: npm test
