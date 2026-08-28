@@ -80,7 +80,7 @@ function boxRow(inner, width) {
 const defaultBrainConfig = {
   provider: 'custom',
   baseURL: 'https://router.nilovr.web.id/v1',
-  api_key: process.env.BRAIN_API_KEY || 'sk-your-brain-api-key',
+  api_key: process.env.BRAIN_API_KEY || '',
   model: 'bd/deepseek-v4-pro-0813',
   timeout_ms: 60000
 };

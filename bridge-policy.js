@@ -14,6 +14,7 @@ const defaultPolicy = Object.freeze({
 
 function mergePolicy(value = {}) {
   return {
+    policy_mode: value.policy_mode,
     protected_paths: [...new Set([...(defaultPolicy.protected_paths || []), ...(value.protected_paths || [])])],
     protected_commands: [...new Set([...(defaultPolicy.protected_commands || []), ...(value.protected_commands || [])])],
     approved_domains: [...new Set(value.approved_domains || [])],
@@ -31,7 +32,10 @@ async function loadPolicy(cwd) {
 }
 
 function wildcard(pattern, value) {
-  const escaped = String(pattern).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  const escaped = String(pattern)
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*\//g, '(?:.*/)?')
+    .replace(/\*/g, '.*');
   return new RegExp('^' + escaped + '$', 'i').test(value);
 }
 
@@ -66,4 +70,20 @@ function classifyAction(action, policy = mergePolicy()) {
   };
 }
 
-module.exports = { defaultPolicy, mergePolicy, loadPolicy, classifyAction, protectedPath, commandRisk, policyFileName };
+const policyModes = ['enforce', 'escalate', 'off'];
+
+function resolvePolicyMode(policy, env) {
+  const raw = (env && env.MIND_LIMB_POLICY_MODE) || (policy && policy.policy_mode) || 'enforce';
+  const mode = String(raw).trim().toLowerCase();
+  if (!policyModes.includes(mode)) {
+    throw new Error('Invalid bridge policy mode: ' + raw + '. Valid modes: enforce, escalate, off.');
+  }
+  return mode;
+}
+
+function policyGate(classified, mode) {
+  if (mode === 'off') return 'proceed';
+  return classified && ['critical', 'high'].includes(classified.risk) ? 'block' : 'proceed';
+}
+
+module.exports = { defaultPolicy, mergePolicy, loadPolicy, classifyAction, protectedPath, commandRisk, resolvePolicyMode, policyGate, policyFileName };

@@ -6,7 +6,7 @@ const crypto = require('node:crypto');
 const path = require('node:path');
 const { runProcess, parseStructuredResult, extractSessionId, buildOpencodeArgs } = require('./bridge-adapter');
 const { appendAction } = require('./bridge-actions');
-const { loadPolicy, classifyAction } = require('./bridge-policy');
+const { loadPolicy, classifyAction, resolvePolicyMode, policyGate } = require('./bridge-policy');
 const { isBrainConsultationEvent, isLegacyConsultationRetry } = require('./bridge-state');
 const { brainConsultChunk, brainReviewProposal, brainReviewResult } = require('./bridge-brain');
 
@@ -48,6 +48,25 @@ async function loadTelemetryPolicy(cwd) {
   } catch {
     return null;
   }
+}
+
+function approvedFileActions(state) {
+  const files = Array.isArray(state && state.approach ? state.approach.files : null) ? state.approach.files : [];
+  return files.map(file => ({ kind: 'file_edit', target: file }));
+}
+
+async function enforcePolicyGate(actions, policy, options = {}) {
+  const mode = resolvePolicyMode(policy, process.env);
+  for (const action of actions) {
+    const classified = classifyAction(action, policy || undefined);
+    if (policyGate(classified, mode) !== 'block') continue;
+    const target = action.target || action.command || action.kind || 'action';
+    const reason = classified.risk === 'critical' && mode === 'enforce'
+      ? 'Policy refused ' + target + ': critical risk under enforce mode. Remove the protected path or destructive command from this chunk.'
+      : 'Policy requires human approval for ' + target + ' (risk: ' + classified.risk + ', mode: ' + mode + ').';
+    return { state: await blockForUser(reason, options, 'escalation'), error: reason };
+  }
+  return null;
 }
 
 async function recordTelemetry(event, options = {}) {
@@ -1103,6 +1122,8 @@ async function consult(options = {}) {
         return { state: await blockForUser('No HANDS session is bound; restart through bridge-runner start.', options), error: 'No HANDS session is bound.' };
       }
       const policy = await loadTelemetryPolicy(options.cwd || root);
+      const gated = await enforcePolicyGate(approvedFileActions(state), policy, options);
+      if (gated) return gated;
       const context = actionContext(
         state,
         'hands-consult',
@@ -1206,6 +1227,8 @@ async function execute(options = {}) {
         return { state: await blockForUser('No HANDS session is bound; restart through bridge-runner start.', options), error: 'No HANDS session is bound.' };
       }
       const policy = await loadTelemetryPolicy(options.cwd || root);
+      const gated = await enforcePolicyGate(approvedFileActions(state), policy, options);
+      if (gated) return gated;
       const context = actionContext(
         state,
         'hands',

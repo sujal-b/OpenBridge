@@ -171,6 +171,17 @@ test('bridge policy exposes safe project defaults', async () => {
     await fs.rm(cwd, { recursive: true, force: true });
   }
 });
+test('bridge open seeds an empty Brain API key so the legacy fallback stays available', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-brainkey-cli-'));
+  try {
+    run(cwd, ['open', cwd]);
+    const config = JSON.parse(await fs.readFile(path.join(cwd, '.bridge', 'brain.json'), 'utf8'));
+    assert.equal(config.api_key, process.env.BRAIN_API_KEY || '');
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('bridge run resumes an interrupted autonomous result review', async () => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-review-cli-'));
   try {

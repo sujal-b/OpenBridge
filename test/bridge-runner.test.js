@@ -771,6 +771,30 @@ test('phase prompts use compact role-aware JSON protocols', () => {
 });
 
 
+test('policy gate blocks a protected approved file before consultation under enforce mode', async () => {
+  const cwd = await createGitWorkspace('');
+  const agentRoles = [];
+  const mockedProcess = async (command, args, options) => {
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    await markBrainConsultation(args, options);
+    agentRoles.push(args[2]);
+    const output = args[2] === 'hands-propose'
+      ? { decision: 'propose', summary: 'Read the environment configuration', files: ['.env'], tests: ['read .env'], sessionID: 'hands-session-policy' }
+      : consultationFor(args, 'hands-session-policy');
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify(output), stderr: '', timed_out: false };
+  };
+  try {
+    await start('Read the environment configuration', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    const blocked = await approve('Approve the env read', { cwd, runProcess: mockedProcess, retryDelayMs: 0 });
+    assert.equal(blocked.state.phase, 'blocked_user');
+    assert.equal(blocked.state.block_kind, 'escalation');
+    assert.match(blocked.state.blocked_reason, /Policy refused \.env: critical risk/i);
+    assert.deepEqual(agentRoles, ['hands-propose']);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('start defaults to Brain-first autonomous review and evaluation', async () => {
   const cwd = await createGitWorkspace('');
   const mockedProcess = async (command, args, options) => {
