@@ -4,56 +4,47 @@
   const hook = document.querySelector('#control-room-hook');
   if (!hook) return;
 
+  const mono = 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+
   const css = document.createElement('style');
   css.textContent = `
-    .control-room { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin:0 0 16px; }
-    .control-room-card { min-width:0; padding:18px; background:linear-gradient(145deg,#16213aee,#10182bee); border:1px solid #263556; border-radius:18px; box-shadow:0 14px 40px #0003; }
-    .control-room-card.mind { border-color:#5e4d9a; }
-    .control-room-card.hands { border-color:#246878; }
-    .control-room-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
-    .control-room-name { font-size:1rem; font-weight:700; }
-    .control-room-role { color:#91a0bd; font-size:.73rem; margin-top:3px; }
-    .control-room-state { color:#68d8ff; font-size:.72rem; text-transform:uppercase; letter-spacing:.08em; white-space:nowrap; }
-    .control-room-current { min-height:38px; margin:12px 0; padding:10px 12px; border:1px solid #263556; border-radius:10px; background:#0c1426aa; font-size:.82rem; }
-    .control-room-events { display:grid; gap:6px; }
-    .control-room-event { display:grid; grid-template-columns:64px 1fr; gap:8px; padding:8px 0; border-top:1px solid #21304d; font-size:.76rem; }
-    .control-room-event time { color:#91a0bd; font: .7rem ui-monospace,monospace; }
-    .control-room-event span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .control-room-footer { display:flex; justify-content:space-between; gap:8px; margin-top:12px; color:#91a0bd; font-size:.72rem; }
-    .control-room-healthy { color:#75e6a1; }
-    .control-room-waiting { color:#ffd166; }
-    .control-room-stale { color:#ff7d8d; }
-    .control-room-empty { color:#91a0bd; font-size:.76rem; }
+    .control-room { display:grid; grid-template-columns:1fr; gap:.75rem; margin:0; font-family:system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .control-room-card { min-width:0; padding:.6rem .7rem; background:var(--panel); border:1px solid var(--line); border-left:2px solid var(--line); border-radius:10px; box-shadow:0 1px 2px rgba(35,38,46,.05); animation:control-room-enter .2s ease-out both; }
+    .control-room-card.mind { border-left-color:var(--mind); }
+    .control-room-card.hands { border-left-color:var(--hands); }
+    .control-room-head { display:flex; justify-content:space-between; align-items:center; gap:.5rem; }
+    .control-room-eyebrow { font-family:${mono}; font-size:.625rem; font-weight:700; letter-spacing:.08em; text-transform:uppercase; }
+    .control-room-card.mind .control-room-eyebrow { color:var(--mind); }
+    .control-room-card.hands .control-room-eyebrow { color:var(--hands); }
+    .control-room-chip { font-family:${mono}; font-size:.625rem; font-weight:600; letter-spacing:.08em; text-transform:uppercase; padding:.125rem .4rem; border:1px solid var(--line); border-radius:999px; color:var(--ink-2); white-space:nowrap; }
+    .control-room-chip.active { color:var(--ink); border-color:var(--ink); }
+    .control-room-chip.blocked { color:var(--alarm); border-color:var(--alarm); }
+    .control-room-role { margin:.2rem 0 0; font-size:.75rem; color:var(--ink-2); }
+    .control-room-current { margin:.35rem 0 0; font-size:.8125rem; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .control-room-footer { margin-top:.5rem; }
+    .control-room-connection { font-family:${mono}; font-size:.625rem; color:var(--ink-2); }
+    .control-room-connection.healthy { color:var(--vitals); }
+    .control-room-connection.stale { color:var(--warn); }
     [data-control][aria-busy="true"] { cursor:wait; }
-    @media (max-width:900px) { .control-room { grid-template-columns:1fr; } }
+    @keyframes control-room-enter { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
+    @media (prefers-reduced-motion: reduce) { .control-room-card { animation:none; } }
   `;
 
   const root = document.createElement('section');
   root.className = 'control-room';
   root.setAttribute('aria-label', 'Live MIND and HANDS control room');
 
-  const state = { snapshot: null, lastSignalAt: 0, busy: false, source: null };
+  const state = { snapshot: null, lastSignalAt: 0, busy: false };
 
   function text(value, fallback = '-') {
     return value === undefined || value === null || value === '' ? fallback : String(value);
   }
 
-  function safeDate(value) {
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? '-' : date.toLocaleTimeString();
-  }
-
-  function roleOf(event) {
-    const agent = String(event && (event.agent || event.active_agent) || '').toLowerCase();
+  function roleOf(source) {
+    const agent = String(source && (source.agent || source.active_agent) || '').toLowerCase();
     if (agent === 'mind' || agent.includes('brain')) return 'mind';
     if (agent.startsWith('hands')) return 'hands';
     return 'system';
-  }
-
-  function entries(snapshot) {
-    const events = (snapshot.events || []).map(event => ({ ...event, role: roleOf(event), summary: event.summary || event.type || 'Lifecycle event' }));
-    const actions = (snapshot.actions || []).map(action => ({ ...action, role: roleOf(action), summary: action.summary || action.kind || 'Action' }));
-    return [...events, ...actions].sort((a, b) => String(a.at).localeCompare(String(b.at)) || Number(a.seq || 0) - Number(b.seq || 0));
   }
 
   function element(tag, className, value) {
@@ -66,18 +57,14 @@
   function createCard(role, name, description) {
     const card = element('article', 'control-room-card ' + role);
     const head = element('div', 'control-room-head');
-    const identity = element('div');
-    identity.append(element('div', 'control-room-name', name), element('div', 'control-room-role', description));
-    const status = element('div', 'control-room-state', 'IDLE');
-    status.dataset.roleState = role;
-    head.append(identity, status);
-    const current = element('div', 'control-room-current', 'Waiting for activity.');
+    const chip = element('span', 'control-room-chip', 'IDLE');
+    chip.dataset.roleState = role;
+    head.append(element('div', 'control-room-eyebrow', name), chip);
+    const current = element('p', 'control-room-current', 'Waiting for activity.');
     current.dataset.roleCurrent = role;
-    const activity = element('div', 'control-room-events');
-    activity.dataset.roleEvents = role;
-    const footer = element('div', 'control-room-footer');
-    footer.append(element('span', 'control-room-waiting', 'Summarized live view'), element('span', 'control-room-connection', 'Connecting...'));
-    card.append(head, current, activity, footer);
+    const footer = element('footer', 'control-room-footer');
+    footer.append(element('span', 'control-room-connection', 'Connecting…'));
+    card.append(head, element('p', 'control-room-role', description), current, footer);
     return card;
   }
 
@@ -86,45 +73,31 @@
   hook.replaceWith(root);
   document.head.append(css);
 
-  function waitingText(role, current, snapshot) {
+  function currentText(role, current, snapshot) {
     if (['done', 'cancelled'].includes(current.phase)) return 'Session ' + current.phase + '.';
-    const err = (snapshot && snapshot.error) || current.block_reason;
-    if (current.phase === 'blocked_user' && err) return 'Blocked: ' + err;
+    if (current.phase === 'blocked_user') {
+      const reason = current.block_reason || (snapshot && snapshot.error);
+      if (reason) return 'Blocked: ' + reason;
+    }
     if (roleOf({ agent: current.active_agent }) === role) return text(current.activity && current.activity.action || current.last_summary, 'Active');
     return role === 'mind' ? 'Idle · waiting for the current HANDS result.' : 'Idle · waiting for the next approved chunk.';
   }
 
   function renderRole(role) {
     const current = state.snapshot && state.snapshot.state || {};
-    const roleEntries = entries(state.snapshot || {}).filter(event => event.role === role).slice(-4);
     const active = roleOf({ agent: current.active_agent }) === role;
     const isBlocked = current.phase === 'blocked_user' && active;
-    const card = root.querySelector('.control-room-card.' + role);
-    if (card) {
-      if (isBlocked) card.style.borderColor = '#d32f2f';
-      else card.style.borderColor = '';
-    }
-    const status = root.querySelector('[data-role-state="' + role + '"]');
+    const chip = root.querySelector('[data-role-state="' + role + '"]');
     const currentNode = root.querySelector('[data-role-current="' + role + '"]');
-    const target = root.querySelector('[data-role-events="' + role + '"]');
-    status.textContent = active ? (isBlocked ? 'BLOCKED' : text(current.phase, 'ACTIVE')) : 'IDLE';
-    if (isBlocked) status.style.color = '#ff7d8d';
-    else status.style.color = '';
-    currentNode.textContent = waitingText(role, current, state.snapshot);
-    target.replaceChildren();
-    if (!roleEntries.length) {
-      target.append(element('p', 'control-room-empty', 'No ' + (role === 'mind' ? 'MIND' : 'HANDS') + ' activity yet.'));
-      return;
-    }
-    for (const item of roleEntries) {
-      const row = element('div', 'control-room-event');
-      row.append(element('time', '', safeDate(item.at)), element('span', '', item.summary));
-      target.append(row);
-    }
+    chip.textContent = active ? (isBlocked ? 'BLOCKED' : text(current.phase, 'ACTIVE')) : 'IDLE';
+    chip.className = 'control-room-chip' + (isBlocked ? ' blocked' : active ? ' active' : '');
+    const line = currentText(role, current, state.snapshot);
+    currentNode.textContent = line;
+    currentNode.title = line;
   }
 
   function render(snapshot) {
-    state.snapshot = snapshot || { state: {}, events: [], actions: [] };
+    state.snapshot = snapshot || { state: {}, controls: [] };
     renderRole('mind');
     renderRole('hands');
     renderConnection();
@@ -132,13 +105,13 @@
 
   function renderConnection() {
     const age = state.lastSignalAt ? Math.max(0, Math.round((Date.now() - state.lastSignalAt) / 1000)) : null;
-    const label = age === null ? 'Connecting...' : age < 30 ? 'Live · ' + age + 's ago' : 'Stale · ' + age + 's ago';
+    const label = age === null ? 'Connecting…' : age < 30 ? 'Live · ' + age + 's ago' : 'Stale · ' + age + 's ago';
+    const tone = age === null ? '' : age < 30 ? 'healthy' : 'stale';
     root.querySelectorAll('.control-room-connection').forEach(node => {
       node.textContent = label;
-      node.className = 'control-room-connection ' + (age === null ? 'control-room-waiting' : age < 30 ? 'control-room-healthy' : 'control-room-stale');
+      node.className = 'control-room-connection ' + tone;
     });
   }
-
 
   function setBusy(value) {
     state.busy = value;
@@ -148,8 +121,13 @@
     });
   }
 
+  function allowedControls() {
+    const snapshot = window.__bridgeSnapshot || state.snapshot;
+    return Array.isArray(snapshot && snapshot.controls) ? snapshot.controls : [];
+  }
+
   function refreshControls() {
-    const allowed = Array.isArray(state.snapshot && state.snapshot.controls) ? state.snapshot.controls : [];
+    const allowed = allowedControls();
     document.querySelectorAll('[data-control]').forEach(button => {
       button.disabled = state.busy || !allowed.includes(button.dataset.control);
     });
@@ -192,16 +170,15 @@
       renderConnection();
     });
     window.addEventListener('bridge-connection', event => {
-      const label = event.detail === 'offline' ? 'Offline' : 'Reconnecting...';
+      const label = event.detail === 'offline' ? 'Offline' : 'Reconnecting…';
       root.querySelectorAll('.control-room-connection').forEach(node => {
         node.textContent = label;
-        node.className = 'control-room-connection control-room-stale';
+        node.className = 'control-room-connection stale';
       });
     });
     if (window.__bridgeSnapshot) receiveSnapshot(window.__bridgeSnapshot);
-    else root.querySelectorAll('.control-room-connection').forEach(node => { node.textContent = 'Waiting for bridge snapshot'; });
   }
 
   window.setInterval(renderConnection, 1000);
-  void connect();
+  connect();
 })();

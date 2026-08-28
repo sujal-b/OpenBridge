@@ -1,169 +1,574 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Mind-Limb Bridge Inspector</title>
-  <style>
-    :root { color-scheme: dark; --bg:#0b1020; --panel:#121a2e; --panel2:#18233d; --line:#263556; --text:#eef4ff; --muted:#91a0bd; --cyan:#68d8ff; --green:#75e6a1; --yellow:#ffd166; --red:#ff7d8d; --purple:#bda3ff; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
-    * { box-sizing:border-box; }
-    body { margin:0; min-height:100vh; background:radial-gradient(circle at 10% 0%, #1b2d52 0, transparent 38rem), var(--bg); color:var(--text); }
-    header { position:sticky; top:0; z-index:5; backdrop-filter:blur(14px); background:#0b1020dd; border-bottom:1px solid var(--line); padding:18px clamp(16px, 4vw, 48px); display:flex; align-items:center; justify-content:space-between; gap:16px; }
-    h1,h2,h3,p { margin:0; }
-    h1 { font-size:clamp(1.05rem, 2vw, 1.45rem); letter-spacing:.02em; }
-    h2 { font-size:1rem; margin-bottom:12px; }
-    .sub { color:var(--muted); font-size:.84rem; margin-top:5px; }
-    .live { display:flex; align-items:center; gap:8px; color:var(--green); font-size:.82rem; white-space:nowrap; }
-    .dot { width:9px; height:9px; border-radius:50%; background:var(--green); box-shadow:0 0 16px var(--green); }
-    .dot.off { background:var(--red); box-shadow:0 0 16px var(--red); }
-    main { width:min(1500px, 100%); margin:0 auto; padding:24px clamp(16px, 4vw, 48px) 48px; }
-    .hero { display:grid; grid-template-columns:1.4fr .6fr; gap:16px; margin-bottom:16px; }
-    .panel { background:linear-gradient(145deg, #16213aee, #10182bee); border:1px solid var(--line); border-radius:18px; box-shadow:0 14px 40px #0003; }
-    .hero .panel { padding:20px; }
-    .phase { display:flex; align-items:center; gap:10px; margin-top:18px; }
-    .phase strong { font-size:1.4rem; letter-spacing:.05em; }
-    .badge { border-radius:999px; padding:5px 9px; font-size:.72rem; border:1px solid currentColor; text-transform:uppercase; }
-    .normal { color:var(--cyan); } .good { color:var(--green); } .warn { color:var(--yellow); } .danger { color:var(--red); }
-    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
-    .stat { padding:12px; border:1px solid var(--line); border-radius:12px; background:#0c1426aa; min-width:0; }
-    .label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.08em; }
-    .value { margin-top:6px; font-size:.92rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-    button { cursor:pointer; border:1px solid var(--line); border-radius:10px; padding:8px 11px; background:#1a2948; color:var(--text); font:inherit; font-size:.82rem; }
-    button:hover { border-color:var(--cyan); transform:translateY(-1px); }
-    button:disabled { cursor:not-allowed; opacity:.4; transform:none; }
-    .layout { display:grid; grid-template-columns:minmax(0,1fr) minmax(280px, .42fr); gap:16px; align-items:start; }
-    .section { padding:18px; }
-    .section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
-    #timeline { display:grid; gap:12px; }
-    .chunk { border:1px solid var(--line); border-radius:14px; overflow:hidden; background:#0c1426aa; }
-    .chunk-head { padding:12px 14px; background:#172440; display:flex; justify-content:space-between; gap:12px; align-items:center; }
-    .chunk-title { font-weight:700; font-size:.88rem; }
-    .chunk-meta { color:var(--muted); font-size:.73rem; }
-    .event { display:grid; grid-template-columns:92px 1fr auto; gap:12px; padding:12px 14px; border-top:1px solid #21304d; cursor:pointer; }
-    .event:hover,.event.selected { background:#1a2948; }
-    .event-time { color:var(--muted); font: .72rem ui-monospace, monospace; }
-    .event-main { min-width:0; }
-    .event-title { font-size:.84rem; font-weight:650; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .event-summary { color:var(--muted); font-size:.76rem; margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .event-tag { align-self:start; font-size:.68rem; border-radius:999px; padding:4px 7px; border:1px solid var(--line); color:var(--cyan); }
-    .event-tag.risk { color:var(--yellow); } .event-tag.error { color:var(--red); }
-    #detail { min-height:260px; }
-    .detail-empty { color:var(--muted); line-height:1.6; }
-    .detail-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; margin:12px 0; }
-    .detail-item { border:1px solid var(--line); border-radius:10px; padding:9px; min-width:0; }
-    .detail-item .value { white-space:normal; overflow-wrap:anywhere; }
-    pre { white-space:pre-wrap; overflow:auto; max-height:300px; background:#080d19; border:1px solid var(--line); border-radius:10px; padding:12px; font:.76rem ui-monospace,monospace; color:#cfe2ff; }
-    .diff { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
-    .diff h3 { font-size:.72rem; color:var(--muted); margin-bottom:5px; }
-    .notice { margin-bottom:16px; padding:11px 13px; border:1px solid #725c24; color:var(--yellow); background:#3b301522; border-radius:10px; display:none; }
-    .notice.show { display:block; }
-    .notice.danger { border-color:#d32f2f; color:#ff8585; background:#4a121244; font-weight:600; }
-    @media (max-width:900px) { .hero,.layout { grid-template-columns:1fr; } .stats { grid-template-columns:repeat(2,1fr); } }
-    @media (max-width:560px) { .event { grid-template-columns:1fr auto; } .event-time { grid-column:1/-1; } .diff { grid-template-columns:1fr; } }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mind-Limb Bridge Inspector</title>
+<style>
+  :root { color-scheme: light dark; --paper:#F2EFE7; --panel:#FBFAF6; --grid:#E2DDCE; --ink:#23262E; --ink-2:#6E7280; --line:#D8D3C4; --mind:#3B3786; --hands:#A05E0B; --vitals:#1E7D5A; --alarm:#C23A2B; --warn:#9A6700; --mono:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; --body:system-ui, -apple-system, "Segoe UI", sans-serif; --gutter:clamp(.8rem, 3vw, 2rem); }
+  @media (prefers-color-scheme: dark) {
+    :root { --paper:#191B21; --panel:#21242C; --grid:#2A2E38; --ink:#E9E7DE; --ink-2:#9BA0AE; --line:#343947; --mind:#8B87E8; --hands:#D89A3E; --vitals:#3DBE8B; --alarm:#E5604F; --warn:#D9A94E; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; height:100dvh; display:flex; flex-direction:column; overflow:hidden; color:var(--ink); font-family:var(--body); line-height:1.5; background:linear-gradient(color-mix(in srgb, var(--grid) 40%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in srgb, var(--grid) 40%, transparent) 1px, transparent 1px), linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px), var(--paper); background-size:24px 24px, 24px 24px, 120px 120px, 120px 120px; }
+  h1, h2, p { margin:0; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; box-shadow:0 1px 2px rgba(35,38,46,.05); }
+  .panel-pad { padding:1rem 1.1rem; min-width:0; }
+  .eyebrow { font:600 .6875rem/1.3 var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--ink-2); }
+  :focus-visible { outline:2px solid var(--ink); outline-offset:2px; }
+
+  .site-head { flex:none; background:color-mix(in srgb, var(--paper) 78%, transparent); backdrop-filter:blur(14px) saturate(140%); border-bottom:1px solid var(--line); padding:.6rem var(--gutter) .5rem; }
+  .head-row { display:flex; align-items:center; justify-content:space-between; gap:1rem; }
+  .head-id { display:flex; align-items:baseline; gap:.7rem; min-width:0; }
+  .wordmark { font:600 1.05rem/1.2 var(--mono); letter-spacing:.14em; white-space:nowrap; }
+  .dash-mind { color:var(--mind); }
+  .dash-hands { color:var(--hands); }
+  #project { font:500 .6875rem/1.4 var(--mono); letter-spacing:.12em; text-transform:uppercase; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .live-pill { display:flex; align-items:center; gap:.45rem; flex:none; padding:.32rem .75rem; border:1px solid var(--line); border-radius:999px; background:var(--panel); font:600 .6875rem/1 var(--mono); letter-spacing:.14em; }
+  .dot { width:8px; height:8px; border-radius:50%; background:var(--ink-2); }
+  .live-pill.live { color:var(--vitals); }
+  .live-pill.live .dot { background:var(--vitals); animation:pulse 2s ease-in-out infinite; }
+  .live-pill.reconnecting { color:var(--warn); }
+  .live-pill.reconnecting .dot { background:var(--warn); }
+  .live-pill.offline { color:var(--alarm); }
+  .live-pill.offline .dot { background:var(--alarm); }
+  @keyframes pulse { 50% { opacity:.3; } }
+
+  #signalStrip { display:grid; grid-template-columns:auto 1fr auto 1fr; gap:.25rem .6rem; align-items:center; height:44px; margin-top:.5rem; }
+  .lane-label { font:600 .625rem/1 var(--mono); letter-spacing:.14em; }
+  .lane-label.mind { color:var(--mind); }
+  .lane-label.hands { color:var(--hands); }
+  .lane { display:flex; align-items:flex-end; gap:2px; height:44px; overflow:hidden; border-bottom:1px solid var(--line); -webkit-mask-image:linear-gradient(to right, transparent, black 8%); mask-image:linear-gradient(to right, transparent, black 8%); }
+  .tick { flex:none; width:4px; border-radius:1px 1px 0 0; transform-origin:bottom; animation:tickIn 180ms ease-out; }
+  #laneMind .tick { background:var(--mind); }
+  #laneHands .tick { background:var(--hands); }
+  .tick.seed { animation:none; }
+  @keyframes tickIn { from { transform:scaleY(.2); } to { transform:scaleY(1); } }
+
+  #notice { display:none; margin:.75rem var(--gutter) 0; padding:.55rem .9rem; border:1px solid var(--line); border-left:3px solid var(--warn); border-radius:10px; background:color-mix(in srgb, var(--warn) 8%, var(--panel)); }
+  #notice.show { display:flex; align-items:baseline; gap:.7rem; }
+  #notice.alarm { border-left-color:var(--alarm); background:color-mix(in srgb, var(--alarm) 8%, var(--panel)); }
+  .notice-eyebrow { flex:none; font:600 .6875rem/1.4 var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--warn); }
+  #notice.alarm .notice-eyebrow { color:var(--alarm); }
+  #noticeBody { flex:1; min-width:0; font-size:.875rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #notice.expanded #noticeBody { white-space:normal; max-height:6rem; overflow:auto; text-overflow:clip; }
+  .notice-toggle { flex:none; appearance:none; cursor:pointer; padding:.15rem .5rem; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink-2); font:600 .625rem/1.3 var(--mono); letter-spacing:.1em; text-transform:uppercase; transition:border-color 120ms ease-out; }
+  .notice-toggle:hover { border-color:var(--ink-2); }
+
+  #hero { flex:none; margin:.75rem var(--gutter) 0; }
+  #pipeline { display:flex; align-items:flex-start; gap:.35rem; }
+  .stage { flex:none; display:flex; flex-direction:column; align-items:center; gap:.35rem; min-width:0; }
+  .stage.mind { color:var(--mind); }
+  .stage.hands { color:var(--hands); }
+  .stage.neutral { color:var(--ink-2); }
+  .stage-dot { width:10px; height:10px; border-radius:50%; border:1.5px solid transparent; background:currentColor; }
+  .stage.past .stage-dot { background:color-mix(in srgb, currentColor 45%, var(--panel)); }
+  .stage.current .stage-dot { box-shadow:0 0 0 4px color-mix(in srgb, currentColor 20%, transparent); }
+  .stage.future .stage-dot { background:transparent; border-color:var(--line); }
+  .stage-label { font:600 .625rem/1.2 var(--mono); letter-spacing:.1em; text-transform:uppercase; color:var(--ink-2); }
+  .stage.current .stage-label { color:var(--ink); }
+  .connector { flex:1; min-width:.5rem; height:1px; margin-top:5px; background:var(--line); }
+  .stage-badge { font:600 .5625rem/1 var(--mono); letter-spacing:.1em; text-transform:uppercase; padding:.22rem .45rem; border-radius:999px; border:1px solid var(--line); color:var(--ink-2); white-space:nowrap; }
+  .stage-badge.warn { color:var(--warn); border-color:color-mix(in srgb, var(--warn) 50%, var(--line)); background:color-mix(in srgb, var(--warn) 8%, var(--panel)); }
+  .stage-badge.alarm { color:var(--alarm); border-color:color-mix(in srgb, var(--alarm) 50%, var(--line)); background:color-mix(in srgb, var(--alarm) 8%, var(--panel)); }
+  .state-line { display:flex; align-items:baseline; gap:.7rem; flex-wrap:wrap; margin-top:.9rem; }
+  #phase { font:600 1.25rem/1.2 var(--mono); letter-spacing:-0.01em; }
+  #phase.alarm { color:var(--alarm); }
+  #phase.vitals { color:var(--vitals); }
+  .chip { display:inline-block; padding:.22rem .6rem; border:1px solid var(--line); border-radius:999px; font:600 .6875rem/1.3 var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--ink-2); }
+  .chip.mind { color:var(--mind); border-color:color-mix(in srgb, var(--mind) 45%, var(--line)); }
+  .chip.hands { color:var(--hands); border-color:color-mix(in srgb, var(--hands) 45%, var(--line)); }
+  #updated { margin-left:auto; font:500 .6875rem/1.4 var(--mono); color:var(--ink-2); font-variant-numeric:tabular-nums; }
+  #task { margin-top:.45rem; font-size:.875rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .controls-block { margin-top:.8rem; padding-top:.65rem; border-top:1px solid var(--line); }
+  .controls-sub { margin:0 0 .6rem; font-size:.8125rem; color:var(--ink-2); }
+  .controls { display:flex; flex-wrap:wrap; gap:.5rem; }
+  .controls button { appearance:none; cursor:pointer; padding:.4rem .7rem; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink); font:600 .6875rem/1 var(--mono); letter-spacing:.06em; text-transform:uppercase; transition:border-color 120ms ease-out, transform 100ms ease-out; }
+  .controls button:hover:not(:disabled) { border-color:var(--ink-2); }
+  .controls button:active:not(:disabled) { transform:scale(.97); }
+  .controls button:disabled { opacity:.38; cursor:not-allowed; }
+  .controls button[data-control="approve"] { background:var(--mind); border-color:var(--mind); color:#fff; }
+  .controls button[data-control="stop"] { border-color:var(--alarm); color:var(--alarm); background:transparent; }
+
+  main { flex:1; min-height:0; display:grid; grid-template-columns:280px minmax(0, 1fr) 360px; gap:1rem; margin:.75rem var(--gutter) .9rem; }
+  .col-head { flex:none; display:flex; align-items:baseline; gap:.6rem; padding:.6rem .8rem; border-bottom:1px solid var(--line); }
+  .rail-panel, .timeline-panel { display:flex; flex-direction:column; min-height:0; }
+  .rail-body { flex:1; min-height:0; overflow:auto; padding:.7rem; display:grid; gap:.7rem; align-content:start; }
+  .vitals-block { display:grid; gap:.5rem; padding:.7rem .8rem; }
+  .vital-row { display:flex; justify-content:space-between; align-items:baseline; gap:.6rem; }
+  .vital-value { font-size:.8125rem; text-align:right; overflow-wrap:anywhere; }
+  .vital-value.vitals { color:var(--vitals); }
+  .vital-value.alarm { color:var(--alarm); }
+
+  #timeline { flex:1; min-height:0; overflow:auto; padding:.75rem; display:grid; gap:.75rem; align-content:start; }
+  .chunk { border:1px solid var(--line); border-radius:8px; overflow:hidden; background:var(--panel); }
+  .chunk-head { display:flex; align-items:center; gap:.6rem; padding:.5rem .7rem; border-bottom:1px solid var(--line); }
+  .chunk-title { flex:1; font:600 .6875rem/1.4 var(--mono); letter-spacing:.14em; text-transform:uppercase; color:var(--ink-2); }
+  .chunk-meta { font:500 .625rem/1.4 var(--mono); color:var(--ink-2); }
+  .chunk-toggle { flex:none; appearance:none; cursor:pointer; width:1.4rem; height:1.4rem; display:grid; place-items:center; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink-2); font:600 .75rem/1 var(--mono); transition:border-color 120ms ease-out; }
+  .chunk-toggle:hover { border-color:var(--ink-2); }
+  .chunk.collapsed .event { display:none; }
+  .event { display:grid; grid-template-columns:4.5rem 1fr auto; gap:.7rem; padding:.55rem .8rem; cursor:pointer; }
+  .event + .event { border-top:1px solid color-mix(in srgb, var(--line) 60%, transparent); }
+  .event:hover { background:color-mix(in srgb, var(--ink) 4%, var(--panel)); }
+  .event.selected { border-left:2px solid var(--ink); padding-left:calc(.8rem - 2px); background:color-mix(in srgb, var(--ink) 6%, var(--panel)); }
+  .event-time { font:500 .6875rem/1.6 var(--mono); color:var(--ink-2); font-variant-numeric:tabular-nums; }
+  .event-main { min-width:0; }
+  .event-title { display:block; font-size:.875rem; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .event-summary { display:block; font-size:.8125rem; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .event-tag { align-self:start; font:600 .625rem/1 var(--mono); letter-spacing:.08em; text-transform:uppercase; padding:.22rem .5rem; border-radius:999px; border:1px solid var(--line); color:var(--ink-2); }
+  .event-tag.risk, .event-tag.error { color:var(--alarm); border-color:color-mix(in srgb, var(--alarm) 50%, var(--line)); background:color-mix(in srgb, var(--alarm) 8%, var(--panel)); }
+  .event.fresh { animation:rowIn 200ms ease-out; }
+  @keyframes rowIn { from { opacity:0; transform:translateY(4px); } }
+
+  .detail-column { display:flex; flex-direction:column; min-height:0; }
+  .detail-panel { flex:1; min-height:0; display:flex; flex-direction:column; }
+  .detail-head h2 { flex:none; font:600 .8125rem/1.4 var(--mono); letter-spacing:.14em; text-transform:uppercase; }
+  #detailKind { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .detail-toggle { flex:none; appearance:none; cursor:pointer; padding:.2rem .55rem; border:1px solid var(--line); border-radius:6px; background:var(--panel); color:var(--ink-2); font:600 .625rem/1.3 var(--mono); letter-spacing:.1em; text-transform:uppercase; transition:border-color 120ms ease-out; }
+  .detail-toggle:hover { border-color:var(--ink-2); }
+  #detail { flex:1; min-height:0; overflow:auto; padding:.75rem; }
+  .detail-empty { color:var(--ink-2); font-size:.875rem; }
+  .detail-grid { display:grid; grid-template-columns:repeat(2, 1fr); gap:.5rem; }
+  .detail-item { border:1px solid var(--line); border-radius:8px; padding:.45rem .6rem; min-width:0; }
+  .detail-value { margin-top:.15rem; font-size:.8125rem; overflow-wrap:anywhere; }
+  .detail-summary { margin-top:.7rem; font-size:.875rem; }
+  #detail pre { margin:.6rem 0 0; padding:.7rem .8rem; border:1px solid var(--line); border-radius:8px; background:var(--paper); font:.75rem/1.5 var(--mono); white-space:pre-wrap; overflow:auto; max-height:18rem; }
+  .diff { display:grid; grid-template-columns:1fr 1fr; gap:.5rem; margin-top:.6rem; }
+  .diff-box { min-width:0; border-radius:8px; padding:0 .4rem .4rem; }
+  .diff-box .eyebrow { padding-top:.6rem; }
+  .diff-box pre { margin:.6rem 0 0; padding:.7rem .8rem; border:1px solid var(--line); border-radius:8px; background:var(--paper); font:.75rem/1.5 var(--mono); white-space:pre-wrap; overflow:auto; max-height:18rem; }
+  .diff-box.before { background:color-mix(in srgb, var(--warn) 6%, var(--panel)); }
+  .diff-box.after { background:color-mix(in srgb, var(--vitals) 6%, var(--panel)); }
+  .detail-placeholder { display:none; flex-direction:column; align-items:flex-start; gap:.6rem; flex:1; padding:.8rem; }
+  .detail-panel.expanded ~ .detail-placeholder, .detail-panel.overlay-closing ~ .detail-placeholder { display:flex; }
+  .detail-panel.expanded, .detail-panel.overlay-closing { position:fixed; top:.75rem; right:.75rem; bottom:.75rem; width:min(620px, 92vw); z-index:30; box-shadow:0 12px 40px rgba(35,38,46,.25); }
+  .detail-panel.expanded { animation:overlayIn 200ms ease-out; }
+  .detail-panel.overlay-closing { animation:overlayOut 200ms ease-out forwards; }
+  @keyframes overlayIn { from { transform:translateX(16px); opacity:0; } to { transform:translateX(0); opacity:1; } }
+  @keyframes overlayOut { from { transform:translateX(0); opacity:1; } to { transform:translateX(16px); opacity:0; } }
+  @keyframes overlayFadeIn { from { opacity:0; } to { opacity:1; } }
+  @keyframes overlayFadeOut { from { opacity:1; } to { opacity:0; } }
+  .detail-scrim { position:fixed; inset:0; background:rgba(35,38,46,.18); z-index:20; display:none; }
+  .detail-scrim.show { display:block; }
+
+  @media (max-width:980px) {
+    body { height:auto; overflow:auto; }
+    main { grid-template-columns:1fr; }
+    #detail { min-height:12rem; }
+    #timeline { min-height:12rem; }
+  }
+  @media (max-width:720px) { #pipeline .stage:not(.current) .stage-label { display:none; } }
+  @media (max-width:560px) { .event { grid-template-columns:1fr auto; } .event-time { grid-column:1 / -1; } .diff, .detail-grid { grid-template-columns:1fr; } }
+  @media (prefers-reduced-motion: reduce) { .tick, .event.fresh { animation:none; } .live-pill.live .dot { animation:none; } .controls button, .chunk-toggle, .detail-toggle, .notice-toggle { transition:none; } .detail-panel.expanded { animation:overlayFadeIn 200ms ease-out; } .detail-panel.overlay-closing { animation:overlayFadeOut 200ms ease-out forwards; } }
+  @media (prefers-reduced-transparency: reduce) { .site-head { background:var(--paper); backdrop-filter:none; } }
+</style>
 </head>
 <body>
-  <header>
-    <div><h1>Mind-Limb Bridge Inspector</h1><p class="sub" id="project">Connecting...</p></div>
-    <div class="live"><span class="dot" id="liveDot"></span><span id="liveText">LIVE</span></div>
-  </header>
-  <main>
-    <div class="notice" id="notice"></div>
-    <section class="hero">
-      <div class="panel">
-        <div class="label">Current workflow</div>
-        <div class="phase"><strong id="phase">UNKNOWN</strong><span class="badge normal" id="agent">IDLE</span></div>
-        <p class="sub" id="task">No active task</p>
-      </div>
-      <div class="panel">
-        <div class="label">Controls</div>
-        <div class="controls" data-control-owner="bridge" data-control-policy="one control at a time" style="margin-top:14px">
-          <button data-control="approve">Approve</button><button data-control="revise">Revise</button><button data-control="pause">Pause</button><button data-control="resume">Resume</button><button data-control="recover">Recover</button><button data-control="done">Finish</button><button data-control="stop">Stop</button>
-        </div>
-        <p class="sub" style="margin-top:12px">Bridge controls this session; one control at a time. Controls are phase-aware and synchronized with the terminal.</p>
-      </div>
-    </section>
-    <div id="control-room-hook" data-agent="mind-hands" aria-label="MIND and HANDS live control room"></div><section class="stats" style="margin-bottom:16px">
-      <div class="stat"><div class="label">Approval</div><div class="value" id="approval">-</div></div>
-      <div class="stat"><div class="label">Now</div><div class="value" id="now">-</div></div>
-      <div class="stat"><div class="label">Git</div><div class="value" id="git">-</div></div>
-      <div class="stat"><div class="label">Events</div><div class="value" id="counts">0</div></div>
-    </section>
-    <div class="layout">
-      <section class="panel section"><div class="section-head"><h2>Session timeline</h2><span class="sub" id="updated">Waiting for first snapshot</span></div><div id="timeline"></div></section>
-      <aside class="panel section"><div class="section-head"><h2>Expanded detail</h2><span class="sub" id="detailKind">Select an event</span></div><div id="detail"><p class="detail-empty">Select an activity card to inspect its intent, target, result, risk, and available details.</p></div></aside>
+<header class="site-head">
+  <div class="head-row">
+    <div class="head-id">
+      <h1 class="wordmark" aria-label="Mind-Limb Bridge Inspector">MIND<span class="dash-mind">—</span>LIMB<span class="dash-hands">—</span>HANDS</h1>
+      <p id="project">Connecting</p>
     </div>
-  </main>
-  <script>
-    const $ = selector => document.querySelector(selector);
-    const state = { snapshot: null, selected: null, source: null };
+    <div class="live-pill live" id="livePill"><span class="dot" id="liveDot"></span><span id="liveText">LIVE</span></div>
+  </div>
+  <div id="signalStrip" aria-hidden="true">
+    <span class="lane-label mind">MIND</span>
+    <div class="lane" id="laneMind"></div>
+    <span class="lane-label hands">HANDS</span>
+    <div class="lane" id="laneHands"></div>
+  </div>
+</header>
+<div id="notice"><span class="notice-eyebrow" id="noticeKind">WARNING</span><span id="noticeBody"></span><button type="button" class="notice-toggle" id="noticeToggle" aria-expanded="false">MORE</button></div>
+<section id="hero" class="panel panel-pad" aria-label="Workflow overview">
+  <div id="pipeline"></div>
+  <div class="state-line">
+    <span class="eyebrow">Phase</span>
+    <div id="phase">Unknown</div>
+    <span class="chip" id="agent">IDLE</span>
+    <p id="updated">Waiting for first snapshot</p>
+  </div>
+  <p id="task">No active task</p>
+  <div class="controls-block">
+    <p class="controls-sub">One control at a time — buttons follow the live phase.</p>
+    <div class="controls" data-control-owner="bridge" data-control-policy="one control at a time">
+      <button type="button" data-control="approve">Approve</button>
+      <button type="button" data-control="revise">Revise</button>
+      <button type="button" data-control="pause">Pause</button>
+      <button type="button" data-control="resume">Resume</button>
+      <button type="button" data-control="recover">Recover</button>
+      <button type="button" data-control="done">Finish</button>
+      <button type="button" data-control="stop">Stop</button>
+    </div>
+  </div>
+</section>
+<main>
+  <div class="rail-panel panel">
+    <div class="col-head"><span class="eyebrow">Live agents</span></div>
+    <div class="rail-body">
+      <div id="control-room-hook" data-agent="mind-hands" aria-label="MIND and HANDS live control room"></div>
+      <div class="vitals-block panel">
+        <div class="vital-row"><span class="eyebrow">Approval</span><span class="vital-value" id="approval">-</span></div>
+        <div class="vital-row"><span class="eyebrow">Git</span><span class="vital-value" id="git">-</span></div>
+        <div class="vital-row"><span class="eyebrow">Events</span><span class="vital-value" id="counts">0 lifecycle / 0 actions</span></div>
+      </div>
+    </div>
+  </div>
+  <section class="timeline-panel panel">
+    <div class="col-head"><span class="eyebrow">Session timeline</span></div>
+    <div id="timeline"></div>
+  </section>
+  <div class="detail-column">
+    <aside class="detail-panel panel" id="detailPanel">
+      <div class="col-head detail-head">
+        <h2>Expanded detail</h2>
+        <div class="eyebrow" id="detailKind">No event selected</div>
+        <button type="button" class="detail-toggle" id="detailExpand" aria-expanded="false">EXPAND</button>
+      </div>
+      <div id="detail"><p class="detail-empty">Select an event to inspect it.</p></div>
+    </aside>
+    <div class="detail-placeholder panel panel-pad">
+      <p class="detail-empty">Detail expanded — press COLLAPSE or Esc to return</p>
+      <button type="button" class="detail-toggle" id="detailCollapse">COLLAPSE</button>
+    </div>
+  </div>
+</main>
+<div class="detail-scrim" id="detailScrim"></div>
+<script>
+  const $ = selector => document.querySelector(selector);
+  const state = { snapshot: null, selected: null, source: null, seen: new Set(), ticked: new Set(), signalStarted: false };
+  const lanes = { mind: $('#laneMind'), hands: $('#laneHands') };
 
-    function text(value, fallback = '-') { return value === undefined || value === null || value === '' ? fallback : String(value); }
-    function setText(selector, value, fallback) { $(selector).textContent = text(value, fallback); }
-    function safeDate(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '-' : date.toLocaleTimeString(); }
-    function eventKey(event) { return [event.kind, event.id, event.seq, event.at].join(':'); }
-    function allEntries(snapshot) {
-      const events = (snapshot.events || []).map(event => ({ ...event, source:'lifecycle', kind:event.kind || event.type || 'lifecycle', summary:event.summary || event.type || 'Lifecycle event' }));
-      const actions = (snapshot.actions || []).map(action => ({ ...action, source:'action', kind:action.kind || 'action', summary:action.summary || 'Action' }));
-      return [...events, ...actions].sort((a,b) => String(a.at).localeCompare(String(b.at)) || Number(a.seq || 0) - Number(b.seq || 0));
+  function text(value, fallback = '-') { return value === undefined || value === null || value === '' ? fallback : String(value); }
+  function setText(selector, value, fallback) { $(selector).textContent = text(value, fallback); }
+  function safeDate(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? '-' : date.toLocaleTimeString(); }
+  function eventKey(event) { return [event.kind, event.type, event.id, event.seq, event.at].join(':'); }
+  function humanize(value) { const raw = String(value || ''); return raw ? raw.replace(/_/g, ' ').replace(/^./, ch => ch.toUpperCase()) : 'Unknown'; }
+  function allEntries(snapshot) {
+    const events = (snapshot.events || []).map(event => ({ ...event, source: 'lifecycle', kind: event.kind || event.type || 'lifecycle', summary: event.summary || event.type || 'Lifecycle event' }));
+    const actions = (snapshot.actions || []).map(action => ({ ...action, source: 'action', kind: action.kind || 'action', summary: action.summary || 'Action' }));
+    return [...events, ...actions].sort((a, b) => String(a.at).localeCompare(String(b.at)) || Number(a.seq || 0) - Number(b.seq || 0));
+  }
+  function groupKey(event, snapshot) { return event.assignment_id || (snapshot.state && snapshot.state.assignment_id) || 'session'; }
+  function statusClass(event) { if (event.status === 'error' || event.type === 'session_cancelled') return 'error'; if (event.risk === 'high' || event.risk === 'critical') return 'risk'; return ''; }
+
+  function setLive(mode) {
+    $('#liveText').textContent = mode === 'live' ? 'LIVE' : mode === 'reconnecting' ? 'RECONNECTING' : 'OFFLINE';
+    $('#livePill').className = 'live-pill ' + mode;
+  }
+  function showNotice(message, kind) {
+    const notice = $('#notice');
+    const expanded = notice.classList.contains('expanded');
+    $('#noticeKind').textContent = kind === 'alarm' ? 'ALARMS' : 'WARNING';
+    $('#noticeBody').textContent = message;
+    notice.className = 'show' + (kind === 'alarm' ? ' alarm' : '') + (expanded ? ' expanded' : '');
+  }
+  function hideNotice() { $('#notice').className = ''; $('#noticeToggle').textContent = 'MORE'; }
+  $('#noticeToggle').addEventListener('click', () => {
+    const notice = $('#notice');
+    const expanded = notice.classList.toggle('expanded');
+    $('#noticeToggle').textContent = expanded ? 'LESS' : 'MORE';
+    $('#noticeToggle').setAttribute('aria-expanded', String(expanded));
+  });
+
+  function tickHeight(entry) {
+    const risk = String(entry.risk || '').toLowerCase();
+    if (risk === 'high' || risk === 'critical' || entry.status === 'error' || entry.type === 'session_cancelled') return '80%';
+    const kind = String(entry.kind || entry.type || '').toLowerCase();
+    if (risk === 'minor' || risk === 'low' || kind.includes('system') || kind.includes('initialized')) return '25%';
+    return '45%';
+  }
+  function ticksFor(entry) {
+    const agent = String(entry.agent || entry.active_agent || '').toLowerCase();
+    if (agent.includes('hand')) return [{ lane: lanes.hands, height: tickHeight(entry) }];
+    if (agent.includes('mind') || agent.includes('brain')) return [{ lane: lanes.mind, height: tickHeight(entry) }];
+    return [{ lane: lanes.mind, height: '25%' }, { lane: lanes.hands, height: '25%' }];
+  }
+  function addTick(lane, height, seed) {
+    const tick = document.createElement('div');
+    tick.className = 'tick' + (seed ? ' seed' : '');
+    tick.style.height = height;
+    lane.append(tick);
+    while (lane.childElementCount > 90) lane.removeChild(lane.firstChild);
+  }
+  function renderSignal(snapshot) {
+    const entries = allEntries(snapshot);
+    if (!state.signalStarted) {
+      state.signalStarted = true;
+      for (const entry of entries) state.ticked.add(eventKey(entry));
+      for (const entry of entries.slice(-40)) for (const tick of ticksFor(entry)) addTick(tick.lane, tick.height, true);
+      return;
     }
-    function groupKey(event, snapshot) { return event.assignment_id || (snapshot.state && snapshot.state.assignment_id) || 'session'; }
-    function statusClass(event) { if (event.status === 'error' || event.type === 'session_cancelled') return 'error'; if (event.risk === 'high' || event.risk === 'critical') return 'risk'; return ''; }
-    function renderSummary(snapshot) {
-      const current = snapshot.state || {};
-      setText('#project', snapshot.project);
-      setText('#phase', current.phase, 'UNKNOWN');
-      setText('#agent', current.active_agent, 'IDLE');
-      setText('#task', current.task, 'No active task');
-      setText('#approval', current.approval);
-      const errMsg = snapshot.error || (current.phase === 'blocked_user' && (current.block_reason || current.last_summary));
-      setText('#now', errMsg ? 'Blocked: ' + errMsg : (current.activity && current.activity.action || current.last_summary));
-      setText('#git', current.git_status);
-      setText('#counts', String((snapshot.events || []).length) + ' lifecycle / ' + String((snapshot.actions || []).length) + ' actions');
-      setText('#updated', 'Updated ' + safeDate(snapshot.generated_at));
-      const phase = String(current.phase || '').toLowerCase();
-      $('#phase').className = phase === 'blocked_user' ? 'danger' : phase === 'done' ? 'good' : 'normal';
-      const allowed = Array.isArray(snapshot.controls) ? snapshot.controls : [];
-      document.querySelectorAll('[data-control]').forEach(button => { button.disabled = !allowed.includes(button.dataset.control); });
-      if (errMsg) showNotice('⚠️ ' + errMsg, true);
-      else if (snapshot.warnings && snapshot.warnings.length) showNotice(snapshot.warnings.map(item => item.message).join(' '));
-      else hideNotice();
+    for (const entry of entries) {
+      const key = eventKey(entry);
+      if (state.ticked.has(key)) continue;
+      state.ticked.add(key);
+      for (const tick of ticksFor(entry)) addTick(tick.lane, tick.height, false);
     }
-    function renderTimeline(snapshot) {
-      const timeline = $('#timeline'); timeline.replaceChildren();
-      const entries = allEntries(snapshot); if (!entries.length) { const empty = document.createElement('p'); empty.className='detail-empty'; empty.textContent='No activity yet.'; timeline.append(empty); return; }
-      const groups = new Map();
-      for (const event of entries) { const key = groupKey(event, snapshot); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(event); }
-      for (const [key, group] of groups) {
-        const chunk = document.createElement('section'); chunk.className='chunk';
-        const head = document.createElement('div'); head.className='chunk-head';
-        const title = document.createElement('div'); title.className='chunk-title'; title.textContent = key === 'session' ? 'Session activity' : 'Task chunk ' + key;
-        const meta = document.createElement('div'); meta.className='chunk-meta'; meta.textContent = group.length + ' events'; head.append(title, meta); chunk.append(head);
-        for (const event of group.slice(-80)) {
-          const row = document.createElement('div'); row.className='event' + (state.selected === eventKey(event) ? ' selected' : ''); row.addEventListener('click', () => { state.selected = eventKey(event); renderTimeline(snapshot); renderDetail(event); });
-          const time = document.createElement('div'); time.className='event-time'; time.textContent=safeDate(event.at);
-          const main = document.createElement('div'); main.className='event-main'; const titleNode=document.createElement('div'); titleNode.className='event-title'; titleNode.textContent=text(event.agent || event.active_agent, 'system') + ' · ' + text(event.kind || event.type, 'event'); const summary=document.createElement('div'); summary.className='event-summary'; summary.textContent=text(event.summary); main.append(titleNode,summary);
-          const tag=document.createElement('div'); tag.className='event-tag ' + statusClass(event); tag.textContent=text(event.status || event.phase || 'event'); row.append(time,main,tag); chunk.append(row);
-        }
-        timeline.append(chunk);
+  }
+
+  const STAGES = [['idle', 'neutral'], ['planning', 'mind'], ['proposing', 'hands'], ['approving', 'mind'], ['consulting', 'mind'], ['executing', 'hands'], ['reviewing', 'mind'], ['done', 'neutral']];
+  const PHASE_STAGE = { idle: 'idle', planning: 'planning', hands_proposing: 'proposing', brain_approving: 'approving', hands_consulting: 'consulting', hands_executing: 'executing', brain_reviewing: 'reviewing', done: 'done' };
+  function stageOf(current) {
+    const phase = String(current.phase || '').toLowerCase();
+    if (phase === 'paused' || phase === 'blocked_user') return PHASE_STAGE[String(current.resume_phase || '').toLowerCase()] || 'planning';
+    if (phase === 'cancelled') return 'done';
+    return PHASE_STAGE[phase] || 'idle';
+  }
+  function renderPipeline(snapshot) {
+    const current = snapshot.state || {};
+    const phase = String(current.phase || '').toLowerCase();
+    const active = stageOf(current);
+    const index = STAGES.findIndex(stage => stage[0] === active);
+    const pipeline = $('#pipeline');
+    pipeline.replaceChildren();
+    STAGES.forEach((stage, i) => {
+      if (i) {
+        const connector = document.createElement('div');
+        connector.className = 'connector';
+        pipeline.append(connector);
       }
-      if (state.selected) { const selected = entries.find(event => eventKey(event) === state.selected); if (selected) renderDetail(selected); else { state.selected = null; renderDetail(null); } }
+      const node = document.createElement('div');
+      node.className = 'stage ' + stage[1] + (i < index ? ' past' : i === index ? ' current' : ' future');
+      const dot = document.createElement('span');
+      dot.className = 'stage-dot';
+      const label = document.createElement('span');
+      label.className = 'stage-label';
+      label.textContent = stage[0];
+      node.append(dot, label);
+      if (i === index && ['paused', 'blocked_user', 'cancelled'].includes(phase)) {
+        const badge = document.createElement('span');
+        badge.className = 'stage-badge' + (phase === 'paused' ? ' warn' : phase === 'blocked_user' ? ' alarm' : '');
+        badge.textContent = phase === 'paused' ? 'PAUSED' : phase === 'blocked_user' ? 'BLOCKED' : 'CANCELLED';
+        node.append(badge);
+      }
+      pipeline.append(node);
+    });
+  }
+
+  function renderSummary(snapshot) {
+    const current = snapshot.state || {};
+    setText('#project', snapshot.project);
+    setText('#phase', humanize(current.phase));
+    setText('#agent', current.active_agent, 'IDLE');
+    const taskText = text(current.task, 'No active task');
+    const taskNode = $('#task');
+    taskNode.textContent = taskText;
+    taskNode.title = taskText;
+    setText('#approval', current.approval);
+    setText('#git', current.git_status);
+    setText('#counts', String((snapshot.events || []).length) + ' lifecycle / ' + String((snapshot.actions || []).length) + ' actions');
+    setText('#updated', safeDate(snapshot.generated_at || current.updated_at) + ' · SEQ ' + text(current.event_seq));
+    const phase = String(current.phase || '').toLowerCase();
+    $('#phase').className = phase === 'blocked_user' ? 'alarm' : phase === 'done' ? 'vitals' : '';
+    const agent = String(current.active_agent || '').toLowerCase();
+    $('#agent').className = 'chip ' + (agent.includes('hand') ? 'hands' : agent.includes('mind') || agent.includes('brain') ? 'mind' : '');
+    $('#approval').className = 'vital-value' + (['approved', 'granted', 'done'].includes(String(current.approval || '').toLowerCase()) ? ' vitals' : '');
+    const allowed = Array.isArray(snapshot.controls) ? snapshot.controls : [];
+    document.querySelectorAll('[data-control]').forEach(button => { button.disabled = !allowed.includes(button.dataset.control); });
+    renderPipeline(snapshot);
+    const errMsg = snapshot.error || (current.phase === 'blocked_user' && (current.block_reason || current.last_summary));
+    if (errMsg) showNotice(errMsg, 'alarm');
+    else if (snapshot.warnings && snapshot.warnings.length) showNotice(snapshot.warnings.map(item => item.message).join(' '), 'warn');
+    else hideNotice();
+  }
+
+  function renderTimeline(snapshot) {
+    const timeline = $('#timeline');
+    timeline.replaceChildren();
+    const entries = allEntries(snapshot);
+    if (!entries.length) { const empty = document.createElement('p'); empty.className = 'detail-empty'; empty.textContent = 'No activity yet.'; timeline.append(empty); return; }
+    const groups = new Map();
+    for (const event of entries) { const key = groupKey(event, snapshot); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(event); }
+    for (const [key, group] of groups) {
+      const chunk = document.createElement('section');
+      chunk.className = 'chunk';
+      const head = document.createElement('div');
+      head.className = 'chunk-head';
+      const title = document.createElement('span');
+      title.className = 'chunk-title';
+      title.textContent = key === 'session' ? 'Session activity' : 'Task chunk ' + key;
+      const meta = document.createElement('span');
+      meta.className = 'chunk-meta';
+      meta.textContent = group.length + ' events';
+      const chevron = document.createElement('button');
+      chevron.type = 'button';
+      chevron.className = 'chunk-toggle';
+      chevron.textContent = '–';
+      chevron.setAttribute('aria-expanded', 'true');
+      chevron.addEventListener('click', () => {
+        const collapsed = chunk.classList.toggle('collapsed');
+        chevron.textContent = collapsed ? '+' : '–';
+        chevron.setAttribute('aria-expanded', String(!collapsed));
+      });
+      head.append(title, meta, chevron);
+      chunk.append(head);
+      for (const event of group.slice(-80)) {
+        const rowKey = eventKey(event);
+        const fresh = !state.seen.has(rowKey);
+        state.seen.add(rowKey);
+        const row = document.createElement('div');
+        row.className = 'event' + (state.selected === rowKey ? ' selected' : '') + (fresh ? ' fresh' : '');
+        row.addEventListener('click', () => { state.selected = eventKey(event); renderTimeline(snapshot); renderDetail(event); });
+        const time = document.createElement('span');
+        time.className = 'event-time';
+        time.textContent = safeDate(event.at);
+        const main = document.createElement('div');
+        main.className = 'event-main';
+        const titleNode = document.createElement('span');
+        titleNode.className = 'event-title';
+        titleNode.textContent = text(event.agent || event.active_agent, 'system') + ' · ' + text(event.kind || event.type, 'event');
+        const summary = document.createElement('span');
+        summary.className = 'event-summary';
+        summary.textContent = text(event.summary);
+        main.append(titleNode, summary);
+        const tag = document.createElement('span');
+        tag.className = 'event-tag ' + statusClass(event);
+        tag.textContent = text(event.status || event.phase || event.source, 'event');
+        row.append(time, main, tag);
+        chunk.append(row);
+      }
+      timeline.append(chunk);
     }
-    function detailItem(parent, label, value) { const item=document.createElement('div'); item.className='detail-item'; const l=document.createElement('div'); l.className='label'; l.textContent=label; const v=document.createElement('div'); v.className='value'; v.textContent=text(value); item.append(l,v); parent.append(item); }
-    function renderDetail(event) {
-      if (!event) { $('#detailKind').textContent='Select an event'; const empty=document.createElement('p'); empty.className='detail-empty'; empty.textContent='Select an activity card to inspect its intent, target, result, risk, and available details.'; $('#detail').replaceChildren(empty); return; } $('#detailKind').textContent=text(event.kind || event.type, 'event'); const detail=$('#detail'); detail.replaceChildren(); const grid=document.createElement('div'); grid.className='detail-grid'; [['Agent',event.agent || event.active_agent],['Action',event.kind || event.type],['Target',event.target],['Status',event.status || event.phase],['Risk',event.risk],['Duration',event.duration_ms === null || event.duration_ms === undefined ? '-' : event.duration_ms + ' ms'],['Revision',event.revision || event.chunk],['At',event.at]].forEach(pair=>detailItem(grid,pair[0],pair[1])); detail.append(grid); const summary=document.createElement('p'); summary.className='sub'; summary.textContent=text(event.summary); detail.append(summary);
-      if (event.detail_ref) { const ref=document.createElement('pre'); ref.textContent='Details: ' + event.detail_ref; detail.append(ref); }
-      if (event.before !== undefined || event.after !== undefined) { const diff=document.createElement('div'); diff.className='diff'; for (const part of [['Before',event.before],['After',event.after]]) { const box=document.createElement('div'); const h=document.createElement('h3'); h.textContent=part[0]; const pre=document.createElement('pre'); pre.textContent=text(part[1]); box.append(h,pre); diff.append(box); } detail.append(diff); }
+    if (state.selected) {
+      const selected = entries.find(event => eventKey(event) === state.selected);
+      if (selected) renderDetail(selected);
+      else { state.selected = null; renderDetail(null); }
     }
-    function showNotice(message, isError = false) { const node=$('#notice'); node.textContent=message; node.className = 'notice show' + (isError ? ' danger' : ''); }
-    function hideNotice() { const node=$('#notice'); node.className = 'notice'; }
-    function apply(snapshot) { if (!snapshot) return; window.__bridgeSnapshot=snapshot; window.dispatchEvent(new CustomEvent('bridge-snapshot',{detail:snapshot})); state.snapshot=snapshot; renderSummary(snapshot); renderTimeline(snapshot); }
-    async function sendControl(action) { const payload={action}; if (action === 'approve' || action === 'revise' || action === 'done') payload.summary=window.prompt(action === 'approve' ? 'Approval note' : action === 'done' ? 'Completion note' : 'Revision request') || ''; try { const response=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}); const value=await response.json(); if (!response.ok) throw new Error(value.error || 'Control failed'); apply(value.snapshot); showNotice(action + ' completed.'); } catch(error) { showNotice(error.message); } }
-    document.querySelectorAll('[data-control]').forEach(button => button.addEventListener('click', () => sendControl(button.dataset.control)));
-    async function initial() { try { state.lastSignalAt=Date.now(); apply(await (await fetch('/api/snapshot')).json()); state.source=new EventSource('/api/stream'); ['snapshot','update'].forEach(type => state.source.addEventListener(type, event => { try { state.lastSignalAt=Date.now(); apply(JSON.parse(event.data)); $('#liveText').textContent='LIVE'; $('#liveDot').classList.remove('off'); } catch { showNotice('The inspector received an invalid update.'); } })); state.source.addEventListener('ping', () => { state.lastSignalAt=Date.now(); window.dispatchEvent(new CustomEvent('bridge-ping')); }); state.source.onerror=()=>{ $('#liveText').textContent='RECONNECTING'; $('#liveDot').classList.add('off'); window.dispatchEvent(new CustomEvent('bridge-connection',{detail:'error'})); }; } catch(error) { showNotice(error.message); $('#liveText').textContent='OFFLINE'; $('#liveDot').classList.add('off'); window.dispatchEvent(new CustomEvent('bridge-connection',{detail:'offline'})); } }
-    initial();
-  </script>
+  }
+
+  function detailItem(parent, label, value) {
+    const item = document.createElement('div');
+    item.className = 'detail-item';
+    const l = document.createElement('div');
+    l.className = 'eyebrow';
+    l.textContent = label;
+    const v = document.createElement('div');
+    v.className = 'detail-value';
+    v.textContent = text(value);
+    item.append(l, v);
+    parent.append(item);
+  }
+  function renderDetail(event) {
+    const kind = $('#detailKind');
+    const detail = $('#detail');
+    if (!event) {
+      kind.textContent = 'No event selected';
+      const empty = document.createElement('p');
+      empty.className = 'detail-empty';
+      empty.textContent = 'Select an event to inspect it.';
+      detail.replaceChildren(empty);
+      return;
+    }
+    kind.textContent = text(event.kind || event.type, 'event');
+    detail.replaceChildren();
+    const grid = document.createElement('div');
+    grid.className = 'detail-grid';
+    [['Agent', event.agent || event.active_agent], ['Action', event.kind || event.type], ['Target', event.target], ['Status', event.status || event.phase], ['Risk', event.risk], ['Duration', event.duration_ms === null || event.duration_ms === undefined ? '-' : event.duration_ms + ' ms'], ['Revision', event.revision || event.chunk], ['At', event.at]].forEach(pair => detailItem(grid, pair[0], pair[1]));
+    detail.append(grid);
+    const summary = document.createElement('p');
+    summary.className = 'detail-summary';
+    summary.textContent = text(event.summary);
+    detail.append(summary);
+    if (event.detail_ref) {
+      const ref = document.createElement('pre');
+      ref.textContent = String(event.detail_ref);
+      detail.append(ref);
+    }
+    if (event.before !== undefined || event.after !== undefined) {
+      const diff = document.createElement('div');
+      diff.className = 'diff';
+      for (const part of [['Before', event.before, 'before'], ['After', event.after, 'after']]) {
+        const box = document.createElement('div');
+        box.className = 'diff-box ' + part[2];
+        const h = document.createElement('div');
+        h.className = 'eyebrow';
+        h.textContent = part[0];
+        const pre = document.createElement('pre');
+        pre.textContent = text(part[1]);
+        box.append(h, pre);
+        diff.append(box);
+      }
+      detail.append(diff);
+    }
+  }
+
+  const detailPanel = $('#detailPanel');
+  function setDetailOverlay(open) {
+    const toggle = $('#detailExpand');
+    if (open) {
+      detailPanel.classList.remove('overlay-closing');
+      detailPanel.classList.add('expanded');
+      $('#detailScrim').classList.add('show');
+      toggle.textContent = 'COLLAPSE';
+      toggle.setAttribute('aria-expanded', 'true');
+    } else {
+      detailPanel.classList.remove('expanded');
+      detailPanel.classList.add('overlay-closing');
+      $('#detailScrim').classList.remove('show');
+      toggle.textContent = 'EXPAND';
+      toggle.setAttribute('aria-expanded', 'false');
+      setTimeout(() => detailPanel.classList.remove('overlay-closing'), 220);
+    }
+  }
+  $('#detailExpand').addEventListener('click', () => setDetailOverlay(!detailPanel.classList.contains('expanded')));
+  $('#detailCollapse').addEventListener('click', () => setDetailOverlay(false));
+  $('#detailScrim').addEventListener('click', () => setDetailOverlay(false));
+  document.addEventListener('keydown', event => { if (event.key === 'Escape' && detailPanel.classList.contains('expanded')) setDetailOverlay(false); });
+
+  async function sendControl(action) {
+    const payload = { action };
+    if (action === 'approve' || action === 'revise' || action === 'done') {
+      const label = action === 'approve' ? 'Approval note' : action === 'revise' ? 'Revision request' : 'Completion note';
+      payload.summary = window.prompt(label) || '';
+    }
+    try {
+      const response = await fetch('/api/control', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+      const value = await response.json();
+      if (!response.ok) throw new Error(value.error || 'Control failed');
+      apply(value.snapshot);
+    } catch (error) {
+      showNotice(error.message, 'alarm');
+    }
+  }
+  document.querySelectorAll('[data-control]').forEach(button => button.addEventListener('click', () => sendControl(button.dataset.control)));
+
+  function apply(snapshot) {
+    if (!snapshot) return;
+    window.__bridgeSnapshot = snapshot;
+    window.dispatchEvent(new CustomEvent('bridge-snapshot', { detail: snapshot }));
+    state.snapshot = snapshot;
+    renderSummary(snapshot);
+    renderTimeline(snapshot);
+    renderSignal(snapshot);
+  }
+
+  async function initial() {
+    try {
+      state.lastSignalAt = Date.now();
+      const response = await fetch('/api/snapshot');
+      apply(await response.json());
+      state.source = new EventSource('/api/stream');
+      ['snapshot', 'update'].forEach(type => state.source.addEventListener(type, event => {
+        try {
+          state.lastSignalAt = Date.now();
+          apply(JSON.parse(event.data));
+          setLive('live');
+        } catch { showNotice('The inspector received an invalid update.', 'warn'); }
+      }));
+      state.source.addEventListener('ping', () => { state.lastSignalAt = Date.now(); window.dispatchEvent(new CustomEvent('bridge-ping')); });
+      state.source.onerror = () => { setLive('reconnecting'); window.dispatchEvent(new CustomEvent('bridge-connection', { detail: 'error' })); };
+    } catch (error) {
+      showNotice(error.message, 'alarm');
+      setLive('offline');
+      window.dispatchEvent(new CustomEvent('bridge-connection', { detail: 'offline' }));
+    }
+  }
+  initial();
+</script>
 <script src="inspector-control-room.js"></script>
 </body>
 </html>
+
+
