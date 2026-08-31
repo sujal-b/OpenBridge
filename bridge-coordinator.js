@@ -1128,6 +1128,18 @@ async function main() {
   if (result) printStatus(result);
 }
 
+process.on('uncaughtException', (err) => {
+  console.error('FATAL: ' + err.message);
+  if (err.stack) console.error(err.stack);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : '';
+  console.error('FATAL: ' + msg);
+  if (stack) console.error(stack);
+  process.exit(1);
+});
 main().catch(error => {
   console.error('Error: ' + error.message);
   process.exitCode = 1;

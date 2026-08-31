@@ -21,4 +21,6 @@ jobs:
           git add .
           git commit -m "baseline" --allow-empty
       - run: npm test
+      - name: Run tests with coverage
+        run: node --test --experimental-test-coverage "test/*.test.js"
 

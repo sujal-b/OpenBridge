@@ -72,6 +72,7 @@ async function enforcePolicyGate(actions, policy, options = {}) {
 const TELEMETRY_MAX_IN_FLIGHT = 8;
 let telemetryInFlight = 0;
 let telemetryQueueTail = Promise.resolve();
+let telemetryDropped = 0;
 
 function recordTelemetry(event, options = {}) {
   // ponytail: beyond 8 queued telemetry appends the event is dropped — losing
@@ -82,6 +83,7 @@ function recordTelemetry(event, options = {}) {
     .then(() => appendAction(event, { cwd: options.cwd || root, lockWaitMs: 2000 }))
     .catch(() => {
       // Observability must not block the coordinator or provider call.
+      telemetryDropped += 1;
       return null;
     })
     .finally(() => { telemetryInFlight -= 1; });
@@ -92,6 +94,8 @@ function recordTelemetry(event, options = {}) {
 function scalar(...values) {
   return values.find(value => typeof value === 'string' || typeof value === 'number') ?? null;
 }
+
+function getTelemetryDropped() { return telemetryDropped; }
 
 function shorten(value, max = 80) {
   const text = String(value || '').replace(/[\r\n]+/g, ' ').trim();
@@ -1440,10 +1444,22 @@ async function main() {
 }
 
 if (require.main === module) {
+  process.on('uncaughtException', (err) => {
+    console.error('FATAL: ' + err.message);
+    if (err.stack) console.error(err.stack);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : '';
+    console.error('FATAL: ' + msg);
+    if (stack) console.error(stack);
+    process.exit(1);
+  });
   main().catch(error => {
     console.error('Error: ' + error.message);
     process.exitCode = 1;
   });
 }
 
-module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError };
+module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError, getTelemetryDropped };

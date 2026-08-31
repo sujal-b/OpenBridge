@@ -10,6 +10,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { runProcess, computeMaxRunTimeoutMs } = require('./bridge-adapter');
 const { startInspectorServer, allowedControls } = require('./bridge-inspector');
+const bridgeConfig = require('./bridge-config');
 
 const bridgeRoot = __dirname;
 const coordinator = path.join(bridgeRoot, 'bridge-coordinator.js');
@@ -39,6 +40,10 @@ const ANSI = {
   // Box drawing helpers (returns string, not escape)
   clear:    '\x1b[2J\x1b[H',
 };
+
+if (process.env.NO_COLOR) {
+  Object.keys(ANSI).forEach(k => { ANSI[k] = ''; });
+}
 
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const ACTIVE_PHASES = new Set(['planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'hands_executing', 'brain_reviewing']);
@@ -80,8 +85,7 @@ function boxRow(inner, width) {
 
 const defaultBrainConfig = {
   provider: 'custom',
-  baseURL: 'https://router.nilovr.web.id/v1',
-  api_key: process.env.BRAIN_API_KEY || '',
+  api_key: process.env.MIND_LIMB_BRAIN_API_KEY || process.env.BRAIN_API_KEY || '',
   model: 'bd/deepseek-v4-pro-0813',
   timeout_ms: 60000
 };
@@ -716,12 +720,17 @@ async function watch(cwd) {
     closed = true;
     clearInterval(timer);
     process.stdout.removeListener('resize', onResize);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
     if (process.stdin.isTTY) {
       process.stdin.setRawMode(false);
       process.stdin.pause();
     }
     process.stdout.write(ANSI.reset + '\x1b[?25h\x1b[?1049l');
   };
+  const onSignal = () => { cleanup(); process.exit(0); };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
   const control = async command => {
     if (busy) return;
     busy = true;
@@ -945,9 +954,21 @@ function help() {
     cmd('bridge status',               'Show current session state'),
     cmd('bridge history [n]',          'Show last n audit log entries'),
     cmd('bridge policy',               'Show project safety policy'),
+
+    section('Config'),
+    cmd('bridge config',               'Show current Brain + Hands config'),
+    cmd('bridge config brain list',    'List available Brain providers'),
+    cmd('bridge config brain add <n>', 'Add a custom Brain provider (interactive)'),
+    cmd('bridge config brain rm <n>',  'Remove a custom Brain provider'),
+    cmd('bridge config brain use <n>', 'Set active Brain provider'),
+    cmd('bridge config hands list',    'List Hands providers from opencode.json'),
+    cmd('bridge config hands add <p> <m>',  'Add a Hands model'),
+    cmd('bridge config hands use <p> <m>',  'Set active Hands model'),
     '',
     ANSI.muted + '  Most commands accept:  --project <folder>' + ANSI.reset,
     ANSI.muted + '  Keyboard shortcuts in dashboard:  [i] steer  [a] approve  [p] pause  [r] resume  [s] stop  [q] quit' + ANSI.reset,
+    '',
+    cmd('bridge --version | -v',          'Show version number'),
     '',
   ].join('\n'));
 }
@@ -961,33 +982,256 @@ async function spawnRunner(runnerArgs, cwd) {
   await fs.mkdir(bridgeDir, { recursive: true });
   const logPath = path.join(bridgeDir, 'runner.log');
   const outFd = fsSync.openSync(logPath, 'a');
-  const now = new Date().toISOString();
-  fsSync.writeSync(outFd, '\n--- Runner started at ' + now + ' (args: ' + runnerArgs.join(' ') + ') ---\n');
-  const child = spawn(process.execPath, [runner, ...runnerArgs], {
-    cwd,
-    detached: true,
-    stdio: ['ignore', outFd, outFd],
-    env: { ...process.env }
-  });
-  const pid = child.pid;
-  if (pid) {
-    fsSync.writeSync(outFd, '--- Runner PID: ' + pid + ' ---\n');
-    await fs.writeFile(
-      path.join(bridgeDir, 'runner.pid'),
-      JSON.stringify({ pid, started_at: Date.now(), token: crypto.randomBytes(12).toString('hex') }) + '\n',
-      'utf8'
-    ).catch(() => {});
+  try {
+    const now = new Date().toISOString();
+    fsSync.writeSync(outFd, '\n--- Runner started at ' + now + ' (args: ' + runnerArgs.join(' ') + ') ---\n');
+    const child = spawn(process.execPath, [runner, ...runnerArgs], {
+      cwd,
+      detached: true,
+      stdio: ['ignore', outFd, outFd],
+      env: { ...process.env }
+    });
+    const pid = child.pid;
+    if (pid) {
+      fsSync.writeSync(outFd, '--- Runner PID: ' + pid + ' ---\n');
+      await fs.writeFile(
+        path.join(bridgeDir, 'runner.pid'),
+        JSON.stringify({ pid, started_at: Date.now(), token: crypto.randomBytes(12).toString('hex') }) + '\n',
+        'utf8'
+      ).catch(() => {});
+    }
+    child.unref();
+  } finally {
+    fsSync.closeSync(outFd);
   }
-  child.unref();
-  fsSync.closeSync(outFd);
   // Brief wait so runner can begin initializing state before watch reads it
   await new Promise(resolve => setTimeout(resolve, 400));
+}
+
+/** Prompt user for input. Returns trimmed string. */
+function ask(rl, question, masked) {
+  return new Promise(resolve => {
+    if (masked) {
+      process.stdout.write(question);
+      const stdin = process.stdin;
+      const wasRaw = stdin.isTTY && stdin.isRaw;
+      if (stdin.isTTY) stdin.setRawMode(true);
+      let value = '';
+      const onData = chunk => {
+        const str = String(chunk);
+        for (const ch of str) {
+          if (ch === '\r' || ch === '\n') {
+            if (stdin.isTTY) stdin.setRawMode(wasRaw || false);
+            stdin.removeListener('data', onData);
+            process.stdout.write('\n');
+            resolve(value.trim());
+            return;
+          }
+          if (ch === '\u0003') { // Ctrl+C
+            if (stdin.isTTY) stdin.setRawMode(wasRaw || false);
+            stdin.removeListener('data', onData);
+            process.stdout.write('\n');
+            resolve('');
+            return;
+          }
+          if (ch === '\u007F' || ch === '\b') {
+            if (value.length > 0) {
+              value = value.slice(0, -1);
+              process.stdout.write('\b \b');
+            }
+          } else {
+            value += ch;
+            process.stdout.write('*');
+          }
+        }
+      };
+      stdin.on('data', onData);
+    } else {
+      rl.question(question, answer => resolve(answer.trim()));
+    }
+  });
+}
+
+async function config(cwd, args) {
+  const sub = (args.shift() || 'show').toLowerCase();
+
+  if (sub === 'show' || sub === '') {
+    // ── Show current config ──────────────────────────────────────────────
+    const activeBrain = await bridgeConfig.getActiveBrainProvider(cwd);
+    const activeHandsModel = await bridgeConfig.getActiveHandsModel(cwd);
+
+    const lines = [
+      '',
+      ANSI.bold + ANSI.primary + '  Bridge Config' + ANSI.reset,
+      '',
+      ANSI.bold + '  Brain' + ANSI.reset,
+      '    Provider:  ' + ANSI.accent + (activeBrain.name || '(none)') + ANSI.reset + (activeBrain.builtin ? ANSI.muted + ' (built-in)' + ANSI.reset : ''),
+      '    Model:     ' + (activeBrain.config?.model || activeBrain.config?.defaultModel || ANSI.muted + '(default)' + ANSI.reset),
+    ];
+    if (activeBrain.config?.api_key || activeBrain.config?.apiKey) {
+      const key = String(activeBrain.config.api_key || activeBrain.config.apiKey);
+      lines.push('    API Key:   ' + ANSI.muted + key.slice(0, 4) + '****' + key.slice(-4) + ANSI.reset);
+    } else {
+      lines.push('    API Key:   ' + ANSI.muted + '(not set)' + ANSI.reset);
+    }
+    if (activeBrain.config?.baseURL || activeBrain.config?.base_url || activeBrain.config?.endpoint) {
+      lines.push('    Base URL:  ' + (activeBrain.config.baseURL || activeBrain.config.base_url || activeBrain.config.endpoint));
+    }
+
+    lines.push('');
+    lines.push(ANSI.bold + '  Hands' + ANSI.reset);
+    if (activeHandsModel) {
+      lines.push('    Provider:  ' + ANSI.primary + activeHandsModel.provider + ANSI.reset);
+      lines.push('    Model:     ' + activeHandsModel.model);
+    } else {
+      lines.push('    ' + ANSI.muted + '(no active model)' + ANSI.reset);
+    }
+
+    const handsProviders = await bridgeConfig.listHandsProviders(cwd);
+    const providerNames = Object.keys(handsProviders);
+    if (providerNames.length) {
+      lines.push('');
+      lines.push(ANSI.bold + '  Available Hands Providers' + ANSI.reset);
+      for (const pName of providerNames) {
+        const p = handsProviders[pName];
+        const models = p.models ? Object.keys(p.models) : [];
+        const isActive = activeHandsModel && activeHandsModel.provider === pName;
+        const marker = isActive ? ANSI.success + ' *' + ANSI.reset : '  ';
+        lines.push('    ' + marker + ' ' + ANSI.primary + pName + ANSI.reset + (models.length ? ANSI.muted + '  (' + models.join(', ') + ')' + ANSI.reset : ''));
+      }
+    }
+
+    lines.push('');
+    process.stdout.write(lines.join('\n'));
+    return;
+  }
+
+  if (sub === 'brain') {
+    const action = (args.shift() || 'list').toLowerCase();
+
+    if (action === 'list') {
+      const providers = await bridgeConfig.listBrainProviders(cwd);
+      const active = await bridgeConfig.getActiveBrainProvider(cwd);
+      const lines = ['', ANSI.bold + '  Brain Providers' + ANSI.reset, ''];
+      for (const [name, info] of Object.entries(providers)) {
+        const marker = active.name === name ? ANSI.success + ' *' + ANSI.reset : '  ';
+        const tag = info.builtin ? ANSI.muted + ' (built-in)' + ANSI.reset : '';
+        const model = info.config?.model ? ANSI.muted + '  ' + info.config.model : '';
+        lines.push('    ' + marker + ' ' + ANSI.accent + name + ANSI.reset + tag + (model ? model + ANSI.reset : ''));
+      }
+      lines.push('');
+      process.stdout.write(lines.join('\n'));
+      return;
+    }
+
+    if (action === 'add') {
+      const name = args[0];
+      if (!name) throw new Error('Usage: bridge config brain add <name>');
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const apiKey = await ask(rl, ANSI.bold + '  API Key: ' + ANSI.reset);
+        const model = await ask(rl, ANSI.bold + '  Model: ' + ANSI.reset);
+        const baseURL = await ask(rl, ANSI.bold + '  Base URL (optional, Enter to skip): ' + ANSI.reset);
+        const providerConfig = { api_key: apiKey, model: model };
+        if (baseURL) providerConfig.baseURL = baseURL;
+        await bridgeConfig.addBrainProvider(cwd, name, providerConfig);
+        process.stdout.write(ANSI.success + '  ✓  ' + ANSI.reset + 'Brain provider "' + name + '" added.\n');
+      } finally {
+        rl.close();
+      }
+      return;
+    }
+
+    if (action === 'remove') {
+      const name = args[0];
+      if (!name) throw new Error('Usage: bridge config brain remove <name>');
+      await bridgeConfig.removeBrainProvider(cwd, name);
+      process.stdout.write(ANSI.success + '  ✓  ' + ANSI.reset + 'Brain provider "' + name + '" removed.\n');
+      return;
+    }
+
+    if (action === 'use') {
+      const name = args[0];
+      if (!name) throw new Error('Usage: bridge config brain use <name>');
+      await bridgeConfig.setActiveBrainProvider(cwd, name);
+      process.stdout.write(ANSI.success + '  ✓  ' + ANSI.reset + 'Active Brain provider: ' + ANSI.accent + name + ANSI.reset + '\n');
+      return;
+    }
+
+    throw new Error('Unknown brain config action: ' + action + '. Use: list, add, remove, use');
+  }
+
+  if (sub === 'hands') {
+    const action = (args.shift() || 'list').toLowerCase();
+
+    if (action === 'list') {
+      const providers = await bridgeConfig.listHandsProviders(cwd);
+      const activeModel = await bridgeConfig.getActiveHandsModel(cwd);
+      const lines = ['', ANSI.bold + '  Hands Providers (opencode.json)' + ANSI.reset, ''];
+      for (const [pName, pConfig] of Object.entries(providers)) {
+        const models = pConfig.models ? Object.keys(pConfig.models) : [];
+        const isProviderActive = activeModel && activeModel.provider === pName;
+        const marker = isProviderActive ? ANSI.success + ' *' + ANSI.reset : '  ';
+        lines.push('    ' + marker + ' ' + ANSI.primary + pName + ANSI.reset);
+        for (const m of models) {
+          const isModelActive = activeModel && activeModel.provider === pName && activeModel.model === m;
+          const mMarker = isModelActive ? ANSI.success + '   *' + ANSI.reset : '    ';
+          lines.push('    ' + mMarker + ' ' + m);
+        }
+      }
+      if (!Object.keys(providers).length) lines.push('    ' + ANSI.muted + '(no providers in opencode.json)' + ANSI.reset);
+      lines.push('');
+      process.stdout.write(lines.join('\n'));
+      return;
+    }
+
+    if (action === 'add') {
+      const provider = args[0];
+      const model = args[1];
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const providerName = provider || await ask(rl, ANSI.bold + '  Provider name: ' + ANSI.reset);
+        const modelName = model || await ask(rl, ANSI.bold + '  Model name: ' + ANSI.reset);
+        if (!providerName || !modelName) throw new Error('Provider name and model name are required.');
+        await bridgeConfig.addHandsProvider(cwd, providerName, { models: { [modelName]: { name: modelName } } });
+        process.stdout.write(ANSI.success + '  ✓  ' + ANSI.reset + 'Hands model "' + modelName + '" added under "' + providerName + '".\n');
+      } finally {
+        rl.close();
+      }
+      return;
+    }
+
+    if (action === 'use') {
+      const provider = args[0];
+      const model = args[1];
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const providerName = provider || await ask(rl, ANSI.bold + '  Provider name: ' + ANSI.reset);
+        const modelName = model || await ask(rl, ANSI.bold + '  Model name: ' + ANSI.reset);
+        if (!providerName || !modelName) throw new Error('Provider name and model name are required.');
+        await bridgeConfig.setActiveHandsModel(cwd, providerName, modelName);
+        process.stdout.write(ANSI.success + '  ✓  ' + ANSI.reset + 'Active Hands model: ' + ANSI.primary + providerName + '/' + modelName + ANSI.reset + '\n');
+      } finally {
+        rl.close();
+      }
+      return;
+    }
+
+    throw new Error('Unknown hands config action: ' + action + '. Use: list, add, use');
+  }
+
+  throw new Error('Unknown config subcommand: ' + sub + '. Use: show, brain, hands');
 }
 
 async function main() {
   const args = process.argv.slice(2);
   const command = args.shift() || 'help';
   if (command === 'help' || command === '--help' || command === '-h') return help();
+  if (command === '--version' || command === '-v') {
+    const pkg = JSON.parse(fsSync.readFileSync(path.join(bridgeRoot, 'package.json'), 'utf8'));
+    process.stdout.write('mind-limb-bridge v' + pkg.version + '\n');
+    return;
+  }
   if (command === 'install') {
     const installArgs = args.slice();
     const explicitProject = installArgs.includes('--project');
@@ -1002,6 +1246,7 @@ async function main() {
   if (command === 'watch') return watch(cwd);
   if (command === 'inspect') return inspect(cwd);
   if (command === 'doctor') return doctor(cwd);
+  if (command === 'config') return config(cwd, args);
 
   if (command === 'run' || command === 'start') {
     await prepareProject(cwd);
@@ -1113,6 +1358,18 @@ async function main() {
 }
 
 if (require.main === module) {
+  process.on('uncaughtException', (err) => {
+    process.stderr.write(ANSI.error + '  FATAL  ' + ANSI.reset + err.message + '\n');
+    if (err.stack) process.stderr.write(err.stack + '\n');
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : '';
+    process.stderr.write(ANSI.error + '  FATAL  ' + ANSI.reset + msg + '\n');
+    if (stack) process.stderr.write(stack + '\n');
+    process.exit(1);
+  });
   main().catch(error => {
     process.stderr.write(ANSI.error + '  Error  ' + ANSI.reset + error.message + '\n');
     process.exitCode = 1;

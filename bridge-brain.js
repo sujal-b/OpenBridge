@@ -3,6 +3,7 @@
 const https = require('node:https');
 const http = require('node:http');
 const { parseStructuredResult } = require('./bridge-adapter');
+const { getActiveBrainProviderSync } = require('./bridge-config');
 
 const PROVIDERS = {
   gemini: {
@@ -42,7 +43,8 @@ const PROVIDERS = {
   },
   custom: {
     endpoint: function(model, key, config) {
-      var base = (config && (config.baseURL || config.base_url || config.endpoint)) || process.env.MIND_LIMB_BRAIN_BASE_URL || 'https://router.nilovr.web.id/v1';
+      var base = (config && (config.baseURL || config.base_url || config.endpoint)) || process.env.MIND_LIMB_BRAIN_BASE_URL;
+      if (!base) throw Object.assign(new Error('Custom provider requires a baseURL. Set it in .bridge/providers.json or via MIND_LIMB_BRAIN_BASE_URL'), { code: 'brain_config_error' });
       return base.replace(/\/+$/, '') + '/chat/completions';
     },
     buildBody: function(prompt, model) { return { model: model || 'bd/deepseek-v4-pro-0813', messages: [{ role: 'user', content: prompt }], max_tokens: 2048, temperature: 0.1 }; },
@@ -71,14 +73,17 @@ function loadBrainConfig(cwd) {
 
 function resolveConfig(options) {
   options = options || {};
-  var config = loadBrainConfig(options.cwd);
-  var provider = options.provider || config.provider || process.env.MIND_LIMB_BRAIN_PROVIDER || (config.baseURL || config.base_url ? 'custom' : 'gemini');
+  var providerConfig = getActiveBrainProviderSync(options.cwd);
+  var legacyConfig = loadBrainConfig(options.cwd);
+  var config = (providerConfig && providerConfig.config) || legacyConfig || {};
+  var provider = options.provider || config.provider || (providerConfig && providerConfig.name) || process.env.MIND_LIMB_BRAIN_PROVIDER || (config.baseURL || config.base_url ? 'custom' : null);
+  if (!provider) throw Object.assign(new Error('No Brain provider configured. Run: bridge config brain add <provider>'), { code: 'brain_config_error' });
   var spec = PROVIDERS[provider];
   if (!spec) throw Object.assign(new Error('Unknown Brain provider: ' + provider + '. Valid: ' + Object.keys(PROVIDERS).join(', ')), { code: 'brain_config_error' });
   var model = options.model || config.model || process.env.MIND_LIMB_BRAIN_MODEL || spec.defaultModel;
-  var apiKey = options.apiKey || config.api_key || config.apiKey || process.env.MIND_LIMB_BRAIN_API_KEY || process.env.GEMINI_API_KEY || '';
-  if (!apiKey && spec.requiresKey !== false) throw Object.assign(new Error('Brain API key not set. Set MIND_LIMB_BRAIN_API_KEY or configure .bridge/brain.json'), { code: 'brain_config_error' });
-  var timeoutMs = options.timeoutMs || config.timeout_ms || 60000;
+  var apiKey = options.apiKey || config.api_key || config.apiKey || process.env.MIND_LIMB_BRAIN_API_KEY || process.env.BRAIN_API_KEY || process.env.GEMINI_API_KEY || '';
+  if (!apiKey && spec.requiresKey !== false) throw Object.assign(new Error('Brain API key not set. Set MIND_LIMB_BRAIN_API_KEY or configure .bridge/providers.json'), { code: 'brain_config_error' });
+  var timeoutMs = options.timeoutMs || config.timeout_ms || config.timeoutMs || 60000;
   return { spec: spec, model: model, apiKey: apiKey, timeoutMs: timeoutMs, provider: provider, config: config };
 }
 

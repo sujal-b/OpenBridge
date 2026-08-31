@@ -2,7 +2,9 @@
 
 const http = require('node:http');
 const fs = require('node:fs/promises');
+const fssync = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 const { runProcess } = require('./bridge-adapter');
 
 const CONTROL_COMMANDS = new Set(['approve', 'revise', 'done', 'pause', 'resume', 'stop', 'recover']);
@@ -145,12 +147,21 @@ function snapshotKey(snapshot) {
   });
 }
 
+function securityHeaders() {
+  return {
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer'
+  };
+}
+
 function jsonResponse(response, status, value) {
   const body = JSON.stringify(value);
   response.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(body)
+    'Content-Length': Buffer.byteLength(body),
+    ...securityHeaders()
   });
   response.end(body);
 }
@@ -159,7 +170,8 @@ function textResponse(response, status, body, contentType) {
   response.writeHead(status, {
     'Content-Type': contentType,
     'Cache-Control': 'no-store',
-    'Content-Length': Buffer.byteLength(body)
+    'Content-Length': Buffer.byteLength(body),
+    ...securityHeaders()
   });
   response.end(body);
 }
@@ -318,7 +330,8 @@ function createInspectorServer(options = {}) {
         'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-store',
         Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no'
+        'X-Accel-Buffering': 'no',
+        ...securityHeaders()
       });
       response.write('retry: 1000\n\n');
       if (!writeEvent(response, 'snapshot', version, currentSnapshot || await readSnapshot(projectRoot))) return response.end();
@@ -338,6 +351,9 @@ function createInspectorServer(options = {}) {
         return jsonResponse(response, error.statusCode || (error instanceof SyntaxError ? 400 : 500), { ok: false, error: error.message });
       }
     }
+    if (req.method === 'GET' && url.pathname === '/api/health') {
+      return jsonResponse(response, 200, { status: 'ok', uptime: process.uptime(), timestamp: new Date().toISOString() });
+    }
     return jsonResponse(response, 404, { error: 'Not found.' });
   }
 
@@ -346,10 +362,13 @@ function createInspectorServer(options = {}) {
     currentSnapshot = await readSnapshot(projectRoot);
     currentKey = snapshotKey(currentSnapshot);
     server = http.createServer((req, response) => {
+      const timer = setTimeout(() => {
+        if (!response.destroyed) response.destroy();
+      }, 30000);
       handleRequest(req, response).catch(error => {
         if (!response.headersSent) jsonResponse(response, 500, { error: error.message });
         else response.destroy();
-      });
+      }).finally(() => clearTimeout(timer));
     });
     await new Promise((resolve, reject) => {
       const onError = error => { server.off('listening', onListening); reject(error); };
