@@ -10,6 +10,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { runProcess, computeMaxRunTimeoutMs } = require('./bridge-adapter');
 const { startInspectorServer, allowedControls } = require('./bridge-inspector');
+const { readJsonlTail, readJsonlPair } = require('./bridge-read');
 const bridgeConfig = require('./bridge-config');
 const latency = require('./bridge-latency');
 
@@ -430,40 +431,55 @@ async function newProject(args) {
   }
 }
 
+const REPAIR_COOLDOWN_MS = 5000;
+let repairInFlight = null;
+let repairCoolUntil = 0;
+
+// The coordinator invocation that rebuilds a corrupt state.json. Extracted so a
+// test can count repairs without spawning a 30s subprocess — this is the only
+// seam. readState(cwd) keeps its signature; production callers never touch it.
+const defaultRepairRunner = cwd => runProcess(process.execPath, [coordinator, 'status'], { cwd, timeoutMs: 30000 });
+let repairRunner = defaultRepairRunner;
+function setRepairRunner(fn) { repairRunner = fn || defaultRepairRunner; }
+
+// Deliberately not a bare SyntaxError: while the cooldown is in effect the session
+// does exist, it is unreadable. Callers key off `code` to say "corrupt, retrying"
+// instead of "no session".
+function repairCooldownError() {
+  const error = new Error('state.json is unreadable; repair already failed and is on cooldown.');
+  error.code = 'STATE_REPAIR_COOLDOWN';
+  return error;
+}
+
 async function readState(cwd) {
   try {
     return JSON.parse(await fs.readFile(path.join(cwd, '.bridge', 'state.json'), 'utf8'));
   } catch (error) {
     if (!(error instanceof SyntaxError)) throw error;
-    const result = await runProcess(process.execPath, [coordinator, 'status'], { cwd, timeoutMs: 30000 });
-    if (!result.ok) throw new Error((result.stderr || result.stdout || 'Coordinator command failed').trim());
-    return JSON.parse(await fs.readFile(path.join(cwd, '.bridge', 'state.json'), 'utf8'));
+    if (repairInFlight) return repairInFlight;
+    if (Date.now() < repairCoolUntil) throw repairCooldownError();
+    repairInFlight = (async () => {
+      const result = await repairRunner(cwd);
+      if (!result.ok) throw new Error((result.stderr || result.stdout || 'Coordinator command failed').trim());
+      return JSON.parse(await fs.readFile(path.join(cwd, '.bridge', 'state.json'), 'utf8'));
+    })();
+    try {
+      return await repairInFlight;
+    } catch (repairError) {
+      repairCoolUntil = Date.now() + REPAIR_COOLDOWN_MS;
+      throw repairError;
+    } finally {
+      repairInFlight = null;
+    }
   }
 }
 
+// Delegates to the shared tail reader (bridge-read.js) so there is exactly one
+// JSONL implementation. Kept as the parameterised entry point because TUI callers
+// and tests need windows other than the two fixed ones below.
 async function readJsonLines(cwd, name, limit = 120, maxBytes = 256 * 1024) {
-  let handle;
-  try {
-    handle = await fs.open(path.join(cwd, '.bridge', name), 'r');
-    const stat = await handle.stat();
-    const start = Math.max(0, stat.size - maxBytes);
-    const buffer = Buffer.alloc(Number(stat.size - start));
-    if (buffer.length) await handle.read(buffer, 0, buffer.length, start);
-    let text = buffer.toString('utf8');
-    if (start > 0) {
-      const firstBreak = text.indexOf('\n');
-      text = firstBreak >= 0 ? text.slice(firstBreak + 1) : '';
-    }
-    const values = [];
-    for (const line of text.split(/\r?\n/).filter(Boolean).slice(-limit)) {
-      try { values.push(JSON.parse(line)); } catch {}
-    }
-    return values;
-  } catch {
-    return [];
-  } finally {
-    if (handle) await handle.close().catch(() => {});
-  }
+  const result = await readJsonlTail(path.join(cwd, '.bridge', name), { maxBytes, limit, source: name });
+  return result.values;
 }
 
 function processAlive(pid) {
@@ -506,8 +522,15 @@ async function runnerIsAlive(cwd) {
   return !(pidAge > staleAfterMs && stateAge > staleAfterMs);
 }
 
-async function readEvents(cwd) { return readJsonLines(cwd, 'events.jsonl', 120); }
-async function readActions(cwd) { return readJsonLines(cwd, 'actions.jsonl', 160); }
+const TUI_EVENTS = { maxBytes: 256 * 1024, limit: 120 };
+const TUI_ACTIONS = { maxBytes: 256 * 1024, limit: 160 };
+
+async function readEvents(cwd) {
+  return readJsonLines(cwd, 'events.jsonl', TUI_EVENTS.limit, TUI_EVENTS.maxBytes);
+}
+async function readActions(cwd) {
+  return readJsonLines(cwd, 'actions.jsonl', TUI_ACTIONS.limit, TUI_ACTIONS.maxBytes);
+}
 
 function parseRunnerOutput(text) {
   try { return JSON.parse(text); } catch { return { text }; }
@@ -704,9 +727,15 @@ function renderDashboard(state, events, cwd, actions = [], runnerAlive = true) {
   return rows.join('\n');
 }
 
+function renderSessionError(error) {
+  if (error && error.code === 'STATE_REPAIR_COOLDOWN') {
+    return ANSI.warn + '  state.json is corrupt; repair on cooldown. Retrying.' + ANSI.reset + '\n' + ANSI.muted + '  ' + error.message + ANSI.reset;
+  }
+  return ANSI.error + '  No bridge session. Run: bridge open .' + ANSI.reset + '\n' + ANSI.muted + '  ' + error.message + ANSI.reset;
+}
+
 async function watch(cwd) {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('bridge watch needs an interactive terminal.');
-  let closed = false;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('bridge watch needs an interactive terminal.');  let closed = false;
   let busy = false;
   let steerActive = false;
   let timer;
@@ -718,16 +747,19 @@ async function watch(cwd) {
     try {
       let output;
       try {
-        const state = await readState(cwd);
-        const events = await readEvents(cwd);
-        const actions = await readActions(cwd);
+        const [state, tails] = await Promise.all([
+          readState(cwd),
+          readJsonlPair(cwd, { events: TUI_EVENTS, actions: TUI_ACTIONS })
+        ]);
+        const events = tails.events.values;
+        const actions = tails.actions.values;
         let runnerAlive = true;
         if (ACTIVE_PHASES.has(state.phase)) {
           runnerAlive = await runnerIsAlive(cwd);
         }
         output = renderDashboard(state, events, cwd, actions, runnerAlive);
       } catch (error) {
-        output = ANSI.error + '  No bridge session. Run: bridge open .' + ANSI.reset + '\n' + ANSI.muted + '  ' + error.message + ANSI.reset;
+        output = renderSessionError(error);
       }
       if (notice) output += '\n\n' + ANSI.warn + '  ' + shorten(notice, 100) + ANSI.reset;
       process.stdout.write('\x1b[H\x1b[2J' + output + '\n');
@@ -1422,4 +1454,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { readJsonLines, controlsFor, controlAllowed, runnerIsAlive };
+module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive };

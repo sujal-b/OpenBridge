@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const { readJsonLines, controlsFor, controlAllowed, runnerIsAlive } = require('../bridge');
+const { readJsonLines, readState, setRepairRunner, controlsFor, controlAllowed, runnerIsAlive } = require('../bridge');
 
 test('bridge watch reads only a bounded tail of long JSONL logs', async () => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-watch-'));
@@ -27,6 +27,62 @@ test('bridge watch returns an empty list for a missing log', async () => {
     await fs.mkdir(path.join(cwd, '.bridge'));
     assert.deepEqual(await readJsonLines(cwd, 'missing.jsonl'), []);
   } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('readState repairs corrupt state once under concurrent callers, then cools down', async () => {
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-repair-'));
+  try {
+    await fs.mkdir(path.join(cwd, '.bridge'), { recursive: true });
+    await fs.writeFile(path.join(cwd, '.bridge', 'state.json'), '{not valid json', 'utf8');
+
+    const stateFile = path.join(cwd, '.bridge', 'state.json');
+    let invocations = 0;
+
+    // Phase A — single-flight. The repair SUCCEEDS and is gated open. Success is
+    // load-bearing: a *failing* repair arms the cooldown, which would stop the
+    // second caller before it ever reaches the single-flight guard, so the test
+    // would pass with the guard deleted.
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    setRepairRunner(async () => {
+      invocations += 1;
+      await gate;
+      await fs.writeFile(stateFile, JSON.stringify({ phase: 'idle' }), 'utf8');
+      return { ok: true, stdout: '', stderr: '' };
+    });
+
+    const first = readState(cwd);
+    await new Promise(resolve => setImmediate(resolve)); // first: read done, repair now in flight
+    const second = readState(cwd);
+    await new Promise(resolve => setImmediate(resolve)); // second: read done, must find repairInFlight
+    release();
+    const [firstState, secondState] = await Promise.all([first, second]);
+
+    assert.equal(invocations, 1, 'concurrent callers share one repair instead of spawning per caller');
+    assert.deepEqual(firstState, { phase: 'idle' });
+    assert.deepEqual(secondState, { phase: 'idle' });
+
+    // Phase B — cooldown. A failing repair arms it; the next caller must get a
+    // distinct error rather than spawning again.
+    await fs.writeFile(stateFile, '{corrupt again', 'utf8');
+    setRepairRunner(async () => {
+      invocations += 1;
+      return { ok: false, stdout: '', stderr: 'coordinator unavailable' };
+    });
+    await assert.rejects(
+      () => readState(cwd),
+      error => error.message === 'coordinator unavailable'
+    );
+    await assert.rejects(
+      () => readState(cwd),
+      error => error.code === 'STATE_REPAIR_COOLDOWN',
+      'a caller arriving during cooldown gets the cooldown error, not a raw SyntaxError'
+    );
+    assert.equal(invocations, 2, 'cooldown suppresses further repairs');
+  } finally {
+    setRepairRunner(null);
     await fs.rm(cwd, { recursive: true, force: true });
   }
 });

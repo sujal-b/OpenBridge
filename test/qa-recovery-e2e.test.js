@@ -894,11 +894,16 @@ test('invariant sweep: full autonomous lifecycle leaves seq contiguous, no temp 
     assert.equal(snapshot.state.phase, 'done');
     assert.equal(snapshot.warnings.length, 0, 'dashboard must report zero warnings on a healthy session');
     const bridgeEntries = await fs.readdir(path.join(cwd, '.bridge'));
-    assert.deepEqual(
-      bridgeEntries.slice().sort(),
-      ['actions.jsonl', 'actions.seq', 'events.jsonl', 'plan.md', 'policy.json', 'state.json'],
-      'store must contain exactly the canonical files'
-    );
+    // Not an exact list: diagnostic artifacts (latency.jsonl and its rotation)
+    // legitimately appear when telemetry is enabled. What must hold is that the
+    // canonical files are all present and no transient artifact was left behind.
+    // Substring match, not a `$` anchor — writers emit both '<name>.tmp' and
+    // '<name>.tmp.<ts>.<rand>' (bridge-config.js, bridge-coordinator.js).
+    for (const name of ['actions.jsonl', 'actions.seq', 'events.jsonl', 'plan.md', 'policy.json', 'state.json']) {
+      assert.ok(bridgeEntries.includes(name), 'store must contain ' + name);
+    }
+    const strays = bridgeEntries.filter(entry => entry.includes('.tmp') || entry.includes('.lock'));
+    assert.deepEqual(strays, [], 'store must not retain temp files or locks');
     const gitLog = spawnSync('git', ['log', '--oneline', '-3'], { cwd, encoding: 'utf8' });
     assert.equal(gitLog.status, 0);
     assert.equal(gitLog.stdout.trim().split(/\r?\n/).length, 1, 'bridge must not create commits in the worktree');

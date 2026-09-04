@@ -6,6 +6,7 @@ const fssync = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { runProcess } = require('./bridge-adapter');
+const { readJsonlPair } = require('./bridge-read');
 
 const CONTROL_COMMANDS = new Set(['approve', 'revise', 'done', 'pause', 'resume', 'stop', 'recover']);
 const SESSION_PHASES = new Set([
@@ -60,23 +61,6 @@ async function readSource(file, maxBytes = 512 * 1024) {
     if (handle) await handle.close().catch(() => {});
   }
 }
-function parseJsonLines(text, source) {
-  const lines = text.split(/\r?\n/);
-  const complete = text.endsWith('\n') || text.endsWith('\r');
-  const values = [];
-  const warnings = [];
-  const last = complete ? lines.length : lines.length - 1;
-  for (let index = 0; index < last; index += 1) {
-    const line = lines[index].trim();
-    if (!line) continue;
-    try {
-      values.push(JSON.parse(line));
-    } catch (error) {
-      warnings.push({ source, type: 'malformed', line: index + 1, message: 'Malformed JSON ignored.' });
-    }
-  }
-  return { values, warnings };
-}
 
 async function readSnapshot(projectRoot = process.cwd()) {
   const cwd = path.resolve(projectRoot);
@@ -85,11 +69,11 @@ async function readSnapshot(projectRoot = process.cwd()) {
     events: sourcePath(cwd, 'events.jsonl'),
     actions: sourcePath(cwd, 'actions.jsonl')
   };
-  const [stateSource, eventsSource, actionsSource] = await Promise.all([
+  const [stateSource, tails] = await Promise.all([
     readSource(files.state, 128 * 1024),
-    readSource(files.events, 512 * 1024),
-    readSource(files.actions, 512 * 1024)
+    readJsonlPair(cwd, { events: { maxBytes: 512 * 1024 }, actions: { maxBytes: 512 * 1024 } })
   ]);
+  const { events, actions } = tails;
   const warnings = [];
   const state = stateSource.available
     ? (() => {
@@ -103,12 +87,10 @@ async function readSnapshot(projectRoot = process.cwd()) {
     : null;
   if (!stateSource.available) warnings.push({ source: 'state.json', type: 'missing', message: stateSource.error });
 
-  const events = eventsSource.available ? parseJsonLines(eventsSource.text, 'events.jsonl') : { values: [], warnings: [] };
-  const actions = actionsSource.available ? parseJsonLines(actionsSource.text, 'actions.jsonl') : { values: [], warnings: [] };
   warnings.push(...events.warnings, ...actions.warnings);
-  if (eventsSource.truncated) warnings.push({ source: 'events.jsonl', type: 'truncated', message: 'Showing the newest events only.' });
-  if (actionsSource.truncated) warnings.push({ source: 'actions.jsonl', type: 'truncated', message: 'Showing the newest actions only.' });
-  if (!eventsSource.available) warnings.push({ source: 'events.jsonl', type: 'missing', message: eventsSource.error });
+  if (events.truncated) warnings.push({ source: 'events.jsonl', type: 'truncated', message: 'Showing the newest events only.' });
+  if (actions.truncated) warnings.push({ source: 'actions.jsonl', type: 'truncated', message: 'Showing the newest actions only.' });
+  if (!events.available) warnings.push({ source: 'events.jsonl', type: 'missing', message: events.error });
   const lastErrorEvent = [...events.values].reverse().find(e => e.type === 'session_blocked' || e.type === 'action_failed' || e.status === 'error' || e.error);
   const error = (state && (state.error || state.block_reason))
     || (state && state.phase === 'blocked_user' && state.last_summary)
@@ -125,8 +107,8 @@ async function readSnapshot(projectRoot = process.cwd()) {
     warnings,
     files: {
       state: { path: files.state, available: stateSource.available },
-      events: { path: files.events, available: eventsSource.available },
-      actions: { path: files.actions, available: actionsSource.available }
+      events: { path: files.events, available: events.available },
+      actions: { path: files.actions, available: actions.available }
     }
   };
 }
@@ -428,7 +410,6 @@ module.exports = {
   allowedControls,
   controlAllowed,
   createInspectorServer,
-  parseJsonLines,
   readSnapshot,
   runControl,
   startInspectorServer

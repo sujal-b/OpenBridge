@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { allowedControls, createInspectorServer, parseJsonLines, readSnapshot } = require('../bridge-inspector');
+const { allowedControls, createInspectorServer, readSnapshot } = require('../bridge-inspector');
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -119,11 +119,13 @@ test('inspector ignores incomplete JSONL tails and bounds large logs', async () 
     const eventFile = path.join(cwd, '.bridge', 'events.jsonl');
     const line = JSON.stringify({ seq: 1, at: new Date().toISOString(), type: 'activity', summary: 'x'.repeat(120) }) + '\n';
     await fs.writeFile(eventFile, line.repeat(6000) + '{"partial":');
-    const parsed = parseJsonLines('{"ok":1}\n{"partial":', 'events.jsonl');
-    assert.deepEqual(parsed.values, [{ ok: 1 }]);
     const snapshot = await readSnapshot(cwd);
     assert.ok(snapshot.events.length < 6000);
     assert.ok(snapshot.warnings.some(item => item.type === 'truncated'));
+    assert.ok(
+      !snapshot.warnings.some(item => item.type === 'malformed'),
+      'a torn tail is skipped, not reported as malformed'
+    );
   } finally {
     await fs.rm(cwd, { recursive: true, force: true });
   }
