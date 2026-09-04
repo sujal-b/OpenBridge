@@ -1,0 +1,7 @@
+{
+  "provider": "custom",
+  "baseURL": "https://router.nilovr.web.id/v1",
+  "api_key": "sk-legacy-123",
+  "model": "bd/deepseek-v4-pro-0813",
+  "timeout_ms": 60000
+}

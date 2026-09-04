@@ -288,6 +288,7 @@ function normalizeState(state) {
 execution_started_at: state.execution_started_at ?? null
   };
   if (!phases.has(normalized.phase)) normalized.phase = 'idle';
+  normalized.schema_version = typeof state?.schema_version === 'number' ? state.schema_version : defaults.schema_version;
   normalized.event_seq = coerceEventSeq(state) ?? 0;
   // Older runners marked transient ask_codex/MCP startup failures as revisions.
   // Only migrate that exact consultation state; material consultation blocks stay revisions.

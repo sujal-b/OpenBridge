@@ -1,4 +1,5 @@
 .bridge/
+!fixtures/**/.bridge/**
 .env
 .env.*
 *.log
@@ -18,3 +19,4 @@ coverage/
 .tmp-test-workspaces/
 
 .omo/
+.workbuddy-ai/

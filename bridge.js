@@ -13,6 +13,7 @@ const { startInspectorServer, allowedControls } = require('./bridge-inspector');
 const { readJsonlTail, readJsonlPair } = require('./bridge-read');
 const bridgeConfig = require('./bridge-config');
 const latency = require('./bridge-latency');
+const { renameWithRetry } = require('./bridge-atomic');
 
 const bridgeRoot = __dirname;
 const coordinator = path.join(bridgeRoot, 'bridge-coordinator.js');
@@ -302,6 +303,149 @@ async function ensureOpencodeConfig(cwd) {
   return false;
 }
 
+async function ensureProvidersConfig(cwd) {
+  const file = path.join(cwd, '.bridge', 'providers.json');
+  try {
+    await fs.access(file);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    const initial = {
+      version: bridgeConfig.MODULE_VERSION,
+      brain: { active: 'zen', custom: {} },
+      hands: { active: null }
+    };
+    await fs.writeFile(file, JSON.stringify(initial, null, 2) + '\n', 'utf8');
+    return true;
+  }
+  return false;
+}
+
+async function migrateProject(cwd, options = {}) {
+  const gen = bridgeConfig.detectGenerationSync(cwd);
+
+  if (gen.providersCorrupt) {
+    throw Object.assign(new Error('Corrupt providers.json: cannot migrate invalid JSON.'), { code: 'providers_corrupt' });
+  }
+
+  // Idempotent no-op when current
+  if (gen.generation === 'gen3' && !gen.isDeadDefault && gen.version === bridgeConfig.MODULE_VERSION) {
+    process.stdout.write(ANSI.success + '  ✓' + ANSI.reset + '  Project is already current (gen3). No migration needed.\n');
+    return { migrated: false, generation: 'gen3', backups: [] };
+  }
+
+  // Dirty working tree guard unless --force
+  const gitResult = await runProcess('git', ['status', '--porcelain'], { cwd, timeoutMs: 15000 }).catch(() => null);
+  if (gitResult && gitResult.ok && gitResult.stdout.trim() && !options.force) {
+    throw Object.assign(new Error('Working tree is dirty. Commit or stash changes before migrating, or use --force.'), { code: 'migration_dirty_tree' });
+  }
+
+  // Active phase guard unless --force
+  try {
+    const state = await readState(cwd);
+    if (ACTIVE_PHASES.has(state.phase) && !options.force) {
+      throw Object.assign(new Error('Session is active in phase ' + state.phase + '. Stop or complete chunk before migrating, or use --force.'), { code: 'migration_active_phase' });
+    }
+  } catch (e) {
+    if (e.code === 'migration_active_phase') throw e;
+  }
+
+  const backups = [];
+  const filesToCheck = [
+    path.join(cwd, '.bridge', 'brain.json'),
+    path.join(cwd, '.bridge', 'providers.json'),
+    path.join(cwd, 'opencode.json')
+  ];
+  const ts = Date.now();
+
+  for (const file of filesToCheck) {
+    try {
+      await fs.access(file);
+      const bak = file + '.bak.' + ts;
+      if (options.dryRun) {
+        process.stdout.write('[DRY RUN] Would backup: ' + file + ' -> ' + bak + '\n');
+      } else {
+        await fs.copyFile(file, bak);
+        process.stdout.write(ANSI.muted + '  Backup created: ' + bak + ANSI.reset + '\n');
+        backups.push(bak);
+      }
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+    }
+  }
+
+  if (options.dryRun) {
+    process.stdout.write('[DRY RUN] Would migrate project ' + cwd + ' to canonical gen3 (active=zen, version=' + bridgeConfig.MODULE_VERSION + ')\n');
+    return { migrated: true, dryRun: true, backups: [] };
+  }
+
+  if (gen.isIntentionalCustom) {
+    // Intentional-custom: ensure version is written to providers.json, but DO NOT touch custom active or baseURL
+    const provData = await bridgeConfig.loadProvidersJson(cwd);
+    provData.version = bridgeConfig.MODULE_VERSION;
+    await bridgeConfig.saveProvidersJson(cwd, provData);
+    process.stdout.write(ANSI.success + '  ✓' + ANSI.reset + '  Intentional custom configuration preserved; updated version to ' + bridgeConfig.MODULE_VERSION + '.\n');
+  } else {
+    // Canonical migration to zen
+    const provData = await bridgeConfig.loadProvidersJson(cwd);
+    provData.brain.active = 'zen';
+    provData.version = bridgeConfig.MODULE_VERSION;
+    await bridgeConfig.saveProvidersJson(cwd, provData);
+
+    // Update opencode.json if dead router or missing
+    const ocfgPath = path.join(cwd, 'opencode.json');
+    let ocfg;
+    try {
+      ocfg = JSON.parse(await fs.readFile(ocfgPath, 'utf8'));
+    } catch {
+      ocfg = defaultOpencodeConfig;
+    }
+    if (ocfg.provider && ocfg.provider['local-router']) {
+      const lrOpts = ocfg.provider['local-router'].options;
+      if (lrOpts && (/router\.nilovr\.web\.id/i.test(lrOpts.baseURL || '') || lrOpts.apiKey === 'sk-legacy-123')) {
+        ocfg.provider['local-router'].options = {
+          baseURL: 'http://localhost:20128/v1',
+          apiKey: '{env:OPENCODE_API_KEY}'
+        };
+        const tmpOcfg = ocfgPath + '.tmp.' + Date.now();
+        await fs.writeFile(tmpOcfg, JSON.stringify(ocfg, null, 2) + '\n', 'utf8');
+        await renameWithRetry(tmpOcfg, ocfgPath);
+      }
+    }
+
+    // Ensure profiles
+    await ensureLocalAgentProfiles(cwd);
+  }
+
+  // Write migration event to .bridge/events.jsonl if it exists
+  const eventsPath = path.join(cwd, '.bridge', 'events.jsonl');
+  try {
+    await fs.access(eventsPath);
+    let maxSeq = -1;
+    try {
+      const rawEvents = await fs.readFile(eventsPath, 'utf8');
+      for (const line of rawEvents.trim().split(/\r?\n/).filter(Boolean)) {
+        try {
+          const ev = JSON.parse(line);
+          if (Number.isInteger(ev.seq) && ev.seq > maxSeq) maxSeq = ev.seq;
+        } catch {}
+      }
+    } catch {}
+    const migrationEvent = JSON.stringify({
+      seq: maxSeq + 1,
+      event: 'migration',
+      from: gen.generation,
+      to: 'gen3',
+      timestamp: new Date().toISOString(),
+      backups: backups
+    }) + '\n';
+    await fs.appendFile(eventsPath, migrationEvent, 'utf8');
+  } catch {}
+
+  process.stdout.write(ANSI.success + '  ✓' + ANSI.reset + '  Project migrated to gen3 (active=zen).\n');
+  return { migrated: true, generation: 'gen3', backups };
+}
+
 async function ensureGitignore(cwd) {
   const file = path.join(cwd, '.gitignore');
   const required = ['.bridge/', '.opencode/', 'node_modules/', 'dist/'];
@@ -337,13 +481,22 @@ async function ensureGitRepo(cwd) {
   }
 }
 
-async function prepareProject(cwd) {
+async function prepareProject(cwd, options = {}) {
+  const autoMigrate = Boolean(options.autoMigrate || process.env.MIND_LIMB_BRIDGE_AUTO_MIGRATE === '1');
+  const gate = bridgeConfig.enforceVersionGate(cwd, { autoMigrate: autoMigrate });
+  if (gate.action === 'auto_migrate') {
+    await migrateProject(cwd, options);
+  } else if (gate.action === 'warn_custom') {
+    process.stderr.write(ANSI.warn + '  [WARN]  ' + ANSI.reset + gate.message + '\n');
+  }
+
   await ensureGitRepo(cwd);
   await invoke(coordinator, ['init'], cwd);
   const gitignoreUpdated = await ensureGitignore(cwd);
   const createdProfiles = await ensureLocalAgentProfiles(cwd);
   await ensureBrainConfig(cwd);
   await ensureOpencodeConfig(cwd);
+  await ensureProvidersConfig(cwd);
   process.stdout.write([
     ANSI.bold + ANSI.primary + '  Bridge  ' + ANSI.reset + ANSI.muted + 'project ready' + ANSI.reset,
     ANSI.muted + '  ' + cwd + ANSI.reset,
@@ -354,6 +507,7 @@ async function prepareProject(cwd) {
     '  ' + (createdProfiles.length ? ANSI.warn + '↑' : ANSI.success + '✓') + ANSI.reset + '  Agent profiles    ' + (createdProfiles.length ? createdProfiles.join(', ') : 'already present'),
     '  ' + ANSI.success + '✓' + ANSI.reset + '  Brain config      .bridge/brain.json',
     '  ' + ANSI.success + '✓' + ANSI.reset + '  OpenCode config   opencode.json',
+    '  ' + ANSI.success + '✓' + ANSI.reset + '  Providers config  .bridge/providers.json',
     '',
   ].join('\n'));
 }
@@ -903,6 +1057,10 @@ async function install() {
 
 async function showStatus(cwd) {
   try {
+    const gen = bridgeConfig.detectGenerationSync(cwd);
+    if (gen.isLegacy) {
+      process.stderr.write(ANSI.warn + '  [WARN]  Project is using ' + gen.generation + ' legacy configuration. Run: bridge config migrate' + ANSI.reset + '\n\n');
+    }
     const state = await readState(cwd);
     printState(state);
   } catch (error) {
@@ -932,6 +1090,8 @@ async function showLatency(cwd, args = []) {
   const spans = await latency.readSpans(cwd);
   const summary = latency.summarize(spans);
   if (args.includes('--json')) {
+    const state = await readState(cwd).catch(() => null);
+    summary.schema_version = state?.schema_version || bridgeConfig.MODULE_VERSION;
     process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
     return;
   }
@@ -978,6 +1138,18 @@ async function doctor(cwd = process.cwd()) {
 
   const ocfgOk = await fs.access(path.join(cwd, 'opencode.json')).then(() => true, () => false);
   checks.push({ name: 'OpenCode', ok: ocfgOk, detail: ocfgOk ? 'opencode.json configured' : 'missing', fix: ocfgOk ? null : 'bridge open .' });
+
+  // Lifecycle & Generation check
+  const gen = bridgeConfig.detectGenerationSync(cwd);
+  if (gen.codeTooOld) {
+    checks.push({ name: 'Lifecycle', ok: false, detail: 'schema_version ' + gen.schema_version + ' > ' + bridgeConfig.MODULE_VERSION + ' (code too old)', fix: 'update mind-limb-bridge' });
+  } else if (gen.isLegacy) {
+    checks.push({ name: 'Lifecycle', ok: false, detail: gen.generation + ' legacy configuration detected', fix: 'bridge config migrate' });
+  } else if (gen.isIntentionalCustom) {
+    checks.push({ name: 'Lifecycle', ok: true, detail: 'gen3 (custom provider: ' + gen.active + ')', fix: null });
+  } else {
+    checks.push({ name: 'Lifecycle', ok: true, detail: 'gen3 (canonical zen)', fix: null });
+  }
 
   // Render
   const nameW = Math.max(...checks.map(c => c.name.length)) + 2;
@@ -1034,6 +1206,7 @@ function help() {
 
     section('Config'),
     cmd('bridge config',               'Show current Brain + Hands config'),
+    cmd('bridge config migrate',       'Migrate legacy project to gen3'),
     cmd('bridge config brain list',    'List available Brain providers'),
     cmd('bridge config brain add <n>', 'Add a custom Brain provider (interactive)'),
     cmd('bridge config brain rm <n>',  'Remove a custom Brain provider'),
@@ -1297,7 +1470,14 @@ async function config(cwd, args) {
     throw new Error('Unknown hands config action: ' + action + '. Use: list, add, use');
   }
 
-  throw new Error('Unknown config subcommand: ' + sub + '. Use: show, brain, hands');
+  if (sub === 'migrate') {
+    const dryRun = args.includes('--dry-run');
+    const force = args.includes('--force');
+    const autoMigrate = args.includes('--auto-migrate');
+    return migrateProject(cwd, { dryRun, force, autoMigrate });
+  }
+
+  throw new Error('Unknown config subcommand: ' + sub + '. Use: show, brain, hands, migrate');
 }
 
 async function main() {
@@ -1319,7 +1499,26 @@ async function main() {
   }
   if (command === 'new') return newProject(args);
   const cwd = projectPath(args);
-  if (command === 'open' || command === 'init') return prepareProject(path.resolve(args[0] || cwd));
+  if (command === 'open' || command === 'init') {
+    const isCheck = args.includes('--check');
+    const isMigrate = args.includes('--migrate');
+    const autoMigrate = args.includes('--auto-migrate');
+    const targetDir = path.resolve(args.find(a => !a.startsWith('-')) || cwd);
+    if (isCheck) {
+      const gen = bridgeConfig.detectGenerationSync(targetDir);
+      process.stdout.write('\n' + ANSI.bold + '  Project Generation: ' + ANSI.reset + ANSI.primary + gen.generation + ANSI.reset + '\n');
+      process.stdout.write('  Legacy: ' + (gen.isLegacy ? ANSI.warn + 'yes' : ANSI.success + 'no') + ANSI.reset + '\n');
+      process.stdout.write('  Active Brain: ' + (gen.active || '(none)') + '\n');
+      if (gen.isLegacy) {
+        process.stdout.write('  ' + ANSI.warn + '→ Run: bridge config migrate --project ' + targetDir + ANSI.reset + '\n\n');
+      }
+      return;
+    }
+    if (isMigrate) {
+      await migrateProject(targetDir, { force: args.includes('--force') });
+    }
+    return prepareProject(targetDir, { autoMigrate });
+  }
   if (command === 'watch') return watch(cwd);
   if (command === 'inspect') return inspect(cwd);
   if (command === 'doctor') return doctor(cwd);

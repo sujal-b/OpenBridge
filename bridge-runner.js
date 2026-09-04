@@ -5,12 +5,21 @@ const fs = require('node:fs/promises');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const { runProcess, parseStructuredResult, extractSessionId, buildOpencodeArgs } = require('./bridge-adapter');
-const { getActiveHandsModel } = require('./bridge-config');
+const { getActiveHandsModel, getActiveBrainProviderSync, detectGenerationSync } = require('./bridge-config');
 const { appendAction } = require('./bridge-actions');
 const { loadPolicy, classifyAction, resolvePolicyMode, policyGate } = require('./bridge-policy');
 const { isBrainConsultationEvent, isLegacyConsultationRetry } = require('./bridge-state');
 const { brainConsultChunk, brainReviewProposal, brainReviewResult } = require('./bridge-brain');
 const latency = require('./bridge-latency');
+
+const ANSI = {
+  reset: '\x1b[0m',
+  warn: '\x1b[33m',
+  error: '\x1b[31m',
+  success: '\x1b[32m',
+  muted: '\x1b[2m'
+};
+if (process.env.NO_COLOR) Object.keys(ANSI).forEach(k => { ANSI[k] = ''; });
 
 const root = process.cwd();
 // Instrument only when the runner is the process entry point. Requiring it as a
@@ -72,6 +81,51 @@ async function enforcePolicyGate(actions, policy, options = {}) {
     return { state: await blockForUser(reason, options, 'escalation'), error: reason };
   }
   return null;
+}
+
+function validatePhaseBoundary(options = {}) {
+  const cwd = options.cwd || root;
+  const gen = detectGenerationSync(cwd);
+  if (gen.providersCorrupt) {
+    const err = Object.assign(new Error('Corrupt providers.json: invalid JSON configuration.'), { code: 'providers_corrupt' });
+    throw err;
+  }
+}
+
+async function runPassiveAfterChecks(state, options = {}) {
+  const cwd = options.cwd || root;
+  try {
+    // 1. Drift warning (report-only, zero writes)
+    const gen = detectGenerationSync(cwd);
+    if (gen.isLegacy) {
+      process.stderr.write(
+        ANSI.warn + '  [WARN] Run completed, but project is still using ' + gen.generation + ' legacy configuration. Run: bridge config migrate' + ANSI.reset + '\n'
+      );
+    }
+
+    // 2. 401 loop detector
+    if (state && (state.phase === 'blocked_user' || state.phase === 'cancelled')) {
+      const isAuthError = reason => /401|unauthorized|invalid.*(?:key|token)/i.test(String(reason || ''));
+      if (isAuthError(state.blocked_reason)) {
+        const eventsRaw = await fs.readFile(path.join(cwd, '.bridge', 'events.jsonl'), 'utf8').catch(() => '');
+        const lines = eventsRaw.trim().split(/\r?\n/).filter(Boolean);
+        let authCount = 0;
+        for (let i = lines.length - 1; i >= 0 && i >= lines.length - 15; i--) {
+          try {
+            const ev = JSON.parse(lines[i]);
+            if (isAuthError(ev.reason || ev.blocked_reason || ev.summary)) {
+              authCount++;
+            }
+          } catch {}
+        }
+        if (authCount >= 2) {
+          process.stderr.write(
+            ANSI.warn + '  [HINT] Repeated 401 authentication failures detected (≥2 runs). Stale credentials suspected. Update your API key in .bridge/providers.json or opencode.json and run bridge resume.' + ANSI.reset + '\n'
+          );
+        }
+      }
+    }
+  } catch {}
 }
 
 const TELEMETRY_MAX_IN_FLIGHT = 8;
@@ -976,6 +1030,11 @@ async function snapshotWorkingTree(cwd) {
 async function reviewResult(execution, options = {}) {
   const state = await readState(options);
   if (state.phase !== 'brain_reviewing') return { state, result: execution };
+  try {
+    validatePhaseBoundary(options);
+  } catch (err) {
+    return { state: await blockForUser(err.message, options, 'escalation'), error: err.message };
+  }
   await runCommand(['activity', 'mind', 'Reviewing completed execution result and evaluation'], options).catch(() => {});
   const beforeEvaluation = await snapshotApprovedFiles(state, options.cwd || root);
   const beforeTree = await snapshotWorkingTree(options.cwd || root);
@@ -1012,6 +1071,10 @@ async function reviewResult(execution, options = {}) {
       try {
         brainResult = await brainReviewResult(state, execution && execution.result || execution, evaluation, options);
       } catch (err) {
+        if (err.statusCode === 401 || (err.code === 'brain_api_failed' && err.statusCode === 401)) {
+          const reason = 'Brain API authentication failed (HTTP 401 Unauthorized): invalid or expired API key. Update your credentials in .bridge/providers.json or opencode.json and run bridge resume.';
+          return { state: await blockForUser(reason, options, 'consultation_retry'), error: reason, evaluation };
+        }
         if (err.code === 'brain_config_error' || options.runProcess) {
           const reviewerAgent = options.resultReviewerAgent || 'hands-consult';
           let brainCall = false;
@@ -1080,6 +1143,7 @@ async function reviewResult(execution, options = {}) {
   }
   const summary = textOf(brainResult, 'Brain reviewed the completed chunk.');
   const done = await runCommand(['done', summary], options);
+  await runPassiveAfterChecks(done, options);
   return { state: done, result: brainResult, evaluation };
 }
 async function autoAdvance(proposed, options = {}) {
@@ -1096,6 +1160,10 @@ async function autoAdvance(proposed, options = {}) {
         try {
           review = await brainReviewProposal(state, options);
         } catch (err) {
+          if (err.statusCode === 401 || (err.code === 'brain_api_failed' && err.statusCode === 401)) {
+            const reason = 'Brain API authentication failed (HTTP 401 Unauthorized): invalid or expired API key. Update your credentials in .bridge/providers.json or opencode.json and run bridge resume.';
+            return { state: await blockForUser(reason, options, 'consultation_retry'), error: reason };
+          }
           if (err.code === 'brain_config_error' || options.runProcess) {
             review = (await reviewProposal(state, options)).result;
           } else {
@@ -1141,14 +1209,25 @@ async function autoAdvance(proposed, options = {}) {
 
 async function blockForUser(reason, options = {}, blockKind) {
   const state = await readState(options);
-  if (['blocked_user', 'paused', 'done', 'cancelled'].includes(state.phase)) return state;
+  if (['blocked_user', 'paused', 'done', 'cancelled'].includes(state.phase)) {
+    await runPassiveAfterChecks(state, options);
+    return state;
+  }
   try {
-    return await runCommand(blockKind ? ['block', '--kind', blockKind, reason] : ['block', reason], options);
+    const next = await runCommand(blockKind ? ['block', '--kind', blockKind, reason] : ['block', reason], options);
+    await runPassiveAfterChecks(next, options);
+    return next;
   } catch (error) {
-    if (/only valid while HANDS is consulting/i.test(String(error.message || ''))) return readState(options);
+    if (/only valid while HANDS is consulting/i.test(String(error.message || ''))) {
+      const cur = await readState(options);
+      await runPassiveAfterChecks(cur, options);
+      return cur;
+    }
     // Older coordinators do not know escalation; retain the safe block.
     if (blockKind && /unsupported block kind|unknown command|invalid transition/i.test(String(error.message || ''))) {
-      return runCommand(['block', reason], options);
+      const next = await runCommand(['block', reason], options);
+      await runPassiveAfterChecks(next, options);
+      return next;
     }
     throw error;
   }
@@ -1251,6 +1330,11 @@ async function consult(options = {}) {
     throw new Error('Brain consultation requires an approved approach; found ' + initial.phase + '.');
   }
   try {
+    validatePhaseBoundary(options);
+  } catch (err) {
+    return { state: await blockForUser(err.message, options, 'needs_revision'), error: err.message };
+  }
+  try {
     return await withAgentLock(options, 'hands-consult', async () => {
       const state = await requireCurrentState(initial, options, ['hands_consulting']);
       if (!state.hands_session_id) {
@@ -1273,7 +1357,10 @@ async function consult(options = {}) {
         try {
           brainGuidance = await brainConsultChunk(state, options);
         } catch (brainError) {
-          if (brainError.code === 'brain_config_error') {
+          if (brainError.statusCode === 401 || (brainError.code === 'brain_api_failed' && brainError.statusCode === 401)) {
+            const reason = 'Brain API authentication failed (HTTP 401 Unauthorized): invalid or expired API key. Update your credentials in .bridge/providers.json or opencode.json and run bridge resume.';
+            return { state: await blockForUser(reason, options, 'consultation_retry'), error: reason };
+          } else if (brainError.code === 'brain_config_error') {
             // No API key configured — fall back to legacy ask_codex flow so the
             // bridge does not hard-fail when Brain config is absent.
             brainGuidance = null;
@@ -1354,6 +1441,11 @@ async function execute(options = {}) {
     const error = new Error('This execution lease was already claimed. Run bridge recover, inspect the working tree, then resume for a fresh Brain consultation.');
     error.code = 'execution_claimed';
     return { state: await blockForUser(error.message, options), error: error.message };
+  }
+  try {
+    validatePhaseBoundary(options);
+  } catch (err) {
+    return { state: await blockForUser(err.message, options, 'escalation'), error: err.message };
   }
   try {
     const executed = await withAgentLock(options, 'hands', async () => {

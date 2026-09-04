@@ -42,7 +42,7 @@ describe('bridge-config', () => {
   describe('loadProvidersJson', () => {
     it('returns empty structure when .bridge/providers.json does not exist', async () => {
       const data = await loadProvidersJson(cwd);
-      assert.deepStrictEqual(data, { brain: { active: null, custom: {} }, hands: { active: null } });
+      assert.deepStrictEqual(data, { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: null } });
     });
 
     it('reads existing providers.json correctly', async () => {
@@ -280,14 +280,12 @@ describe('bridge-config', () => {
       }
     });
 
-    it('returns default gemini when nothing is configured', async () => {
+    it('returns null when nothing is configured', async () => {
       // Clean state: no providers.json, no brain.json
       const emptyCwd = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-config-empty-'));
       try {
         const result = await getActiveBrainProvider(emptyCwd);
-        assert.equal(result.name, 'gemini');
-        assert.equal(result.builtin, true);
-        assert.equal(result.config, null);
+        assert.equal(result, null);
       } finally {
         await fs.rm(emptyCwd, { recursive: true, force: true });
       }
@@ -554,7 +552,7 @@ describe('bridge-config', () => {
       const tempCwd = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-config-sync-'));
       try {
         const data = loadProvidersJsonSync(tempCwd);
-        assert.deepStrictEqual(data, { brain: { active: null, custom: {} }, hands: { active: null } });
+        assert.deepStrictEqual(data, { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: null } });
       } finally {
         await fs.rm(tempCwd, { recursive: true, force: true });
       }

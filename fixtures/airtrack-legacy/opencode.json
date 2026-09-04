@@ -1,0 +1,17 @@
+{
+  "provider": {
+    "local-router": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local Router",
+      "options": {
+        "baseURL": "https://router.nilovr.web.id/v1",
+        "apiKey": "sk-legacy-123"
+      },
+      "models": {
+        "bd/Deepseek-V4-Flash-0731": {
+          "name": "Deepseek-V4-Flash-0731"
+        }
+      }
+    }
+  }
+}

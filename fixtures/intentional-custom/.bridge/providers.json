@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "brain": {
+    "active": "custom",
+    "custom": {
+      "custom": {
+        "model": "my-local-model",
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "api_key": "custom-key"
+      }
+    }
+  },
+  "hands": {
+    "active": null
+  }
+}
