@@ -11,6 +11,7 @@ const { spawn } = require('node:child_process');
 const { runProcess, computeMaxRunTimeoutMs } = require('./bridge-adapter');
 const { startInspectorServer, allowedControls } = require('./bridge-inspector');
 const bridgeConfig = require('./bridge-config');
+const latency = require('./bridge-latency');
 
 const bridgeRoot = __dirname;
 const coordinator = path.join(bridgeRoot, 'bridge-coordinator.js');
@@ -84,9 +85,9 @@ function boxRow(inner, width) {
 }
 
 const defaultBrainConfig = {
-  provider: 'custom',
-  api_key: process.env.MIND_LIMB_BRAIN_API_KEY || process.env.BRAIN_API_KEY || '',
-  model: 'bd/deepseek-v4-pro-0813',
+  provider: 'zen',
+  api_key: '',
+  model: 'opencode/muse-spark-1.3-contributor-free',
   timeout_ms: 60000
 };
 
@@ -114,7 +115,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge execution agent. Edits only the approved chunk.',
     'mode: primary',
-    'model: local-router/bd/Deepseek-V4-Flash-0731',
+    'model: opencode/muse-spark-1.2-contributor-free',
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -141,7 +142,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge read-only proposal agent.',
     'mode: primary',
-    'model: local-router/bd/Deepseek-V4-Flash-0731',
+    'model: opencode/muse-spark-1.2-contributor-free',
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -164,7 +165,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge consultation gate. Confirms Brain guidance injected by the bridge.',
     'mode: primary',
-    'model: local-router/bd/Deepseek-V4-Flash-0731',
+    'model: opencode/muse-spark-1.2-contributor-free',
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -187,7 +188,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge read-only evaluator. Reviews one completed HANDS chunk.',
     'mode: primary',
-    'model: local-router/bd/Deepseek-V4-Flash-0731',
+    'model: opencode/muse-spark-1.2-contributor-free',
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -206,6 +207,29 @@ const localAgentProfiles = {
     'You are HANDS-EVALUATE. Read only the approved files and recorded validation.',
     'Return exactly one JSON object: {"decision":"passed|failed|blocked","summary":"short result","tests":["focused check"],"risks":["risk"]}.',
     'Run only supplied non-mutating checks. Do not edit files, call Brain, or expand the approved scope.'
+  ].join('\n') + '\n',
+  'brain.md': [
+    '---',
+    'description: Bridge Brain architect. Reviews proposals and chunks via opencode.',
+    'mode: primary',
+    'model: opencode/muse-spark-1.3-contributor-free',
+    'permission:',
+    '  "*": deny',
+    '  read: allow',
+    '  glob: allow',
+    '  grep: allow',
+    '  list: allow',
+    '  lsp: allow',
+    '  task: deny',
+    '  skill: deny',
+    '  external_directory: deny',
+    '  edit: deny',
+    '  bash: deny',
+    '  ask-codex_*: deny',
+    '---',
+    '',
+    'You are BRAIN, the senior architect. Review HANDS proposals and chunks.',
+    'Return JSON only, no prose.'
   ].join('\n') + '\n'
 };
 
@@ -239,7 +263,7 @@ async function ensureLocalAgentProfiles(cwd) {
     const file = path.join(directory, name);
     try {
       const existing = await fs.readFile(file, 'utf8');
-      if (existing.includes('opencode/deepseek-v4-flash-free') || existing.includes('oc/x-preview-f-free')) {
+      if (existing.includes('opencode/deepseek-v4-flash-free') || existing.includes('oc/x-preview-f-free') || existing.includes('local-router/bd/Deepseek-V4-Flash-0731') || existing.includes('local-router/bd/deepseek')) {
         await fs.writeFile(file, contents, 'utf8');
         created.push(name + ' (updated)');
       }
@@ -865,6 +889,26 @@ async function showPolicy(cwd) {
   }
 }
 
+async function showLatency(cwd, args = []) {
+  const file = latency.latencyFile(cwd);
+  if (args.includes('--clear')) {
+    await fs.rm(file, { force: true });
+    await fs.rm(file + '.1', { force: true });
+    process.stdout.write('Cleared ' + file + '\n');
+    return;
+  }
+  const spans = await latency.readSpans(cwd);
+  const summary = latency.summarize(spans);
+  if (args.includes('--json')) {
+    process.stdout.write(JSON.stringify(summary, null, 2) + '\n');
+    return;
+  }
+  process.stdout.write('\n' + ANSI.bold + ANSI.primary + '  bridge latency' + ANSI.reset + '\n\n');
+  process.stdout.write(latency.formatReport(summary) + '\n\n');
+  process.stdout.write(ANSI.muted + '  ' + file + ANSI.reset + '\n');
+  process.stdout.write(ANSI.muted + '  --json for machine-readable output, --clear to reset' + ANSI.reset + '\n\n');
+}
+
 async function doctor(cwd = process.cwd()) {
   process.stdout.write('\n' + ANSI.bold + ANSI.primary + '  bridge doctor' + ANSI.reset + '\n\n');
 
@@ -883,18 +927,18 @@ async function doctor(cwd = process.cwd()) {
   }
 
   // Profile checks
-  const profileNames = ['hands.md', 'hands-propose.md', 'hands-consult.md', 'hands-evaluate.md'];
+  const profileNames = ['hands.md', 'hands-propose.md', 'hands-consult.md', 'hands-evaluate.md', 'brain.md'];
   const profileChecks = await Promise.all(profileNames.map(async n => {
     try { await fs.access(path.join(cwd, '.opencode', 'agents', n)); return true; } catch { return false; }
   }));
   const profilesOk = profileChecks.every(Boolean);
   const missingProfiles = profileNames.filter((_, i) => !profileChecks[i]);
-  checks.push({ name: 'Profiles', ok: profilesOk, detail: profilesOk ? '4 bridge agents ready' : 'missing: ' + missingProfiles.join(', '), fix: profilesOk ? null : 'bridge open .' });
+  checks.push({ name: 'Profiles', ok: profilesOk, detail: profilesOk ? '5 bridge agents ready' : 'missing: ' + missingProfiles.join(', '), fix: profilesOk ? null : 'bridge open .' });
 
   // Agent list check
   const agents = await runProcess('opencode', ['agent', 'list'], { cwd, timeoutMs: 15000 });
-  const agentsOk = agents.ok && ['hands', 'hands-propose', 'hands-consult', 'hands-evaluate'].every(a => agents.stdout.includes(a));
-  checks.push({ name: 'Agents', ok: agentsOk, detail: agentsOk ? 'hands · hands-propose · hands-consult · hands-evaluate' : 'run: opencode agent list', fix: agentsOk ? null : 'opencode agent list' });
+  const agentsOk = agents.ok && ['hands', 'hands-propose', 'hands-consult', 'hands-evaluate', 'brain'].every(a => agents.stdout.includes(a));
+  checks.push({ name: 'Agents', ok: agentsOk, detail: agentsOk ? 'hands · hands-propose · hands-consult · hands-evaluate · brain' : 'run: opencode agent list', fix: agentsOk ? null : 'opencode agent list' });
 
   // Config files
   const brainOk = await fs.access(path.join(cwd, '.bridge', 'brain.json')).then(() => true, () => false);
@@ -954,6 +998,7 @@ function help() {
     cmd('bridge status',               'Show current session state'),
     cmd('bridge history [n]',          'Show last n audit log entries'),
     cmd('bridge policy',               'Show project safety policy'),
+    cmd('bridge latency [--json]',     'P50/P95 per phase from .bridge/latency.jsonl'),
 
     section('Config'),
     cmd('bridge config',               'Show current Brain + Hands config'),
@@ -1246,6 +1291,7 @@ async function main() {
   if (command === 'watch') return watch(cwd);
   if (command === 'inspect') return inspect(cwd);
   if (command === 'doctor') return doctor(cwd);
+  if (command === 'latency') return showLatency(cwd, args);
   if (command === 'config') return config(cwd, args);
 
   if (command === 'run' || command === 'start') {

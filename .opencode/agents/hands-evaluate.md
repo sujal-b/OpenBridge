@@ -1,7 +1,7 @@
 ---
 description: Bridge read-only evaluator. Reviews one completed HANDS chunk.
 mode: primary
-model: local-router/bd/Deepseek-V4-Flash-0731
+model: opencode/muse-spark-1.2-contributor-free
 permission:
   "*": deny
   read: allow

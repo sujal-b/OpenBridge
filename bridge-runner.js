@@ -5,12 +5,17 @@ const fs = require('node:fs/promises');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const { runProcess, parseStructuredResult, extractSessionId, buildOpencodeArgs } = require('./bridge-adapter');
+const { getActiveHandsModel } = require('./bridge-config');
 const { appendAction } = require('./bridge-actions');
 const { loadPolicy, classifyAction, resolvePolicyMode, policyGate } = require('./bridge-policy');
 const { isBrainConsultationEvent, isLegacyConsultationRetry } = require('./bridge-state');
 const { brainConsultChunk, brainReviewProposal, brainReviewResult } = require('./bridge-brain');
+const latency = require('./bridge-latency');
 
 const root = process.cwd();
+// Instrument only when the runner is the process entry point. Requiring it as a
+// library (tests, inspector) must never write telemetry into anyone's .bridge/.
+if (require.main === module) latency.install(root);
 const coordinator = path.join(__dirname, 'bridge-coordinator.js');
 const opencodeCommand = process.env.MIND_LIMB_OPENCODE_COMMAND || 'opencode';
 const sharedTimeoutMs = Number(process.env.MIND_LIMB_AGENT_TIMEOUT_MS);
@@ -96,6 +101,14 @@ function scalar(...values) {
 }
 
 function getTelemetryDropped() { return telemetryDropped; }
+
+// Telemetry appends are fire-and-forget from the provider stream, so pending
+// writes would otherwise be lost when the process exits. Call this before exit.
+async function drainTelemetry() {
+  for (let guard = 0; guard < 50 && telemetryInFlight > 0; guard += 1) {
+    await telemetryQueueTail.catch(() => {});
+  }
+}
 
 function shorten(value, max = 80) {
   const text = String(value || '').replace(/[\r\n]+/g, ' ').trim();
@@ -301,14 +314,27 @@ async function readState(options = {}) {
 async function runCommand(args, options = {}) {
   const cwd = options.cwd || root;
   const processRunner = options.runProcess || runProcess;
-  const result = await processRunner(process.execPath, [coordinator, ...args], {
-    cwd,
-    timeoutMs: 30000
+  const span = latency.startSpan('coord.' + String(args[0] || 'unknown'), {
+    kind: 'coord',
+    command: String(args[0] || '')
   });
-  if (!result.ok) {
-    throw new Error((result.stderr || result.stdout || 'Coordinator command failed').trim());
+  try {
+    const result = await processRunner(process.execPath, [coordinator, ...args], {
+      cwd,
+      timeoutMs: 30000
+    });
+    if (!result.ok) {
+      throw new Error((result.stderr || result.stdout || 'Coordinator command failed').trim());
+    }
+    // readState can spawn the coordinator again when state.json is corrupt, so
+    // it belongs inside the measured window.
+    const state = await readState(options);
+    span.end({ ok: true });
+    return state;
+  } catch (error) {
+    span.fail(error);
+    throw error;
   }
-  return readState(options);
 }
 
 function processAlive(pid) {
@@ -386,23 +412,84 @@ async function withAgentLock(options, agent, action) {
   }
 }
 
-async function invokeAgent(agent, prompt, options = {}) {
+// Provider streams emit an event per tool call, and execution can produce
+// dozens to hundreds of them. Every one of these used to spawn a coordinator
+// subprocess (two Node processes) to write state.activity — which the dashboard
+// polls at ~1Hz anyway. Coalesce: only the newest summary matters, and it is
+// worth at most one coordinator round trip per interval.
+const activityFlushMs = Math.max(0, Number(process.env.MIND_LIMB_ACTIVITY_FLUSH_MS) || 400);
+
+function createActivityPusher(agent, options) {
+  let lastSentAt = 0;
+  let lastSent = null;
+  let pending = null;
+  let timer = null;
+  let inFlight = Promise.resolve();
+
+  const send = summary => {
+    lastSentAt = Date.now();
+    lastSent = summary;
+    // Serialize sends so they cannot interleave on the coordinator lock, but
+    // never await one from the provider stream.
+    inFlight = inFlight.then(() => runCommand(['activity', agent, summary], options)).catch(() => {});
+    return inFlight;
+  };
+
+  return {
+    push(summary) {
+      if (!summary) return;
+      pending = summary;
+      if (timer) return;
+      const waitMs = Math.max(0, lastSentAt + activityFlushMs - Date.now());
+      timer = setTimeout(() => {
+        timer = null;
+        const next = pending;
+        pending = null;
+        if (next && next !== lastSent) void send(next);
+      }, waitMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    },
+    // Awaited once at the end of an agent call so the final activity is never lost.
+    async flush() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      const next = pending;
+      pending = null;
+      if (next && next !== lastSent) await send(next);
+      await inFlight;
+    }
+  };
+}
+
+async function invokeAgentInner(agent, prompt, options = {}) {
+  let model = options.model;
+  if (!model) {
+    const active = await getActiveHandsModel(options.cwd || root).catch(() => null);
+    if (active && active.provider && active.model) {
+      model = `${active.provider}/${active.model}`;
+    }
+  }
   const args = buildOpencodeArgs(prompt, {
     agent,
     cwd: options.cwd || root,
     sessionId: options.sessionId,
-    model: options.model
+    model
   });
   const processRunner = options.runProcess || runProcess;
+  const activityPusher = options.actionContext && options.actionContext.agent
+    ? createActivityPusher(options.actionContext.agent, options)
+    : null;
   const providerEvents = options.actionContext
-    ? async event => {
+    ? event => {
       const record = providerEventRecord(event, options.actionContext);
-      if (record) {
-        await recordTelemetry(record, options);
-        if (record.summary && options.actionContext?.agent) {
-          await runCommand(['activity', options.actionContext.agent, record.summary], options).catch(() => {});
-        }
-      }
+      if (!record) return;
+      // Observability is best-effort. Telemetry and the dashboard activity write
+      // must never serialize the provider stream — awaiting either here made the
+      // event-processing chain as slow as the slowest coordinator round trip.
+      void recordTelemetry(record, options);
+      if (activityPusher) activityPusher.push(record.summary);
     }
     : null;
   const timeoutMs = options.timeoutMs ?? (agent === 'hands' ? defaultExecutionTimeoutMs : defaultProposalTimeoutMs);
@@ -414,7 +501,14 @@ async function invokeAgent(agent, prompt, options = {}) {
   };
   if (options.onLine) processOptions.onLine = options.onLine;
   if (options.onEvent || providerEvents) processOptions.onEvent = combineCallbacks(options.onEvent, providerEvents);
-  const result = await processRunner(options.command || opencodeCommand, args, processOptions);
+  let result;
+  try {
+    result = await processRunner(options.command || opencodeCommand, args, processOptions);
+  } finally {
+    // Flush even when the provider call throws, so the last observed activity
+    // (often the failure itself) still reaches the dashboard.
+    if (activityPusher) await activityPusher.flush();
+  }
   const sessionId = extractSessionId(result.stdout);
   if (!result.ok) {
     const rawDetail = (result.timed_out
@@ -444,6 +538,25 @@ async function invokeAgent(agent, prompt, options = {}) {
   }
 }
 
+async function invokeAgent(agent, prompt, options = {}) {
+  const span = latency.startSpan('agent.' + agent, {
+    kind: 'agent',
+    agent,
+    attempt: options.attempt || 1,
+    session_reused: Boolean(options.sessionId),
+    prompt_bytes: Buffer.byteLength(String(prompt)),
+    timeout_ms: options.timeoutMs ?? (agent === 'hands' ? defaultExecutionTimeoutMs : defaultProposalTimeoutMs)
+  });
+  try {
+    const value = await invokeAgentInner(agent, prompt, options);
+    span.end({ ok: true });
+    return value;
+  } catch (error) {
+    span.fail(error);
+    throw error;
+  }
+}
+
 function retryableProviderError(error) {
   if (!error || ['agent_busy', 'stale_state', 'invalid_transition'].includes(error.code)) return false;
   const message = String(error.message || '').toLowerCase();
@@ -462,6 +575,12 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
   const attempts = Math.min(3, Math.max(1, Number.isFinite(configuredAttempts) ? Math.trunc(configuredAttempts) : defaultRetryAttempts));
   const delayMs = Math.max(0, Number.isFinite(Number(options.retryDelayMs)) ? Number(options.retryDelayMs) : defaultRetryDelayMs);
   let sessionId = options.sessionId;
+  if (!options.model) {
+    const active = await getActiveHandsModel(options.cwd || root).catch(() => null);
+    if (active && active.provider && active.model) {
+      options = { ...options, model: `${active.provider}/${active.model}` };
+    }
+  }
   const fallbackModel = agent === 'hands-propose'
     ? (options.proposalFallbackModel || process.env.MIND_LIMB_PROPOSAL_FALLBACK_MODEL || 'opencode/big-pickle')
     : null;
@@ -487,6 +606,7 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
         && options.model !== fallbackModel;
       const details = await invokeAgent(agent, retryPrompt, {
         ...options,
+        attempt,
         sessionId,
         ...(useFallbackModel ? { model: fallbackModel } : {})
       });
@@ -1443,6 +1563,46 @@ async function main() {
   throw new Error('Unknown command: ' + command);
 }
 
+// ─── Phase instrumentation ───────────────────────────────────────────────────
+// Phase spans are installed by rebinding the function declarations. Identifier
+// lookups resolve at call time, so internal callers (execute -> reviewResult,
+// start -> propose, autoAdvance -> autoApprove) hit the wrapped versions too.
+// A phase that starts while another is on the stack is marked nested:true;
+// phase.execute therefore includes phase.reviewResult when running autonomously.
+let phaseDepth = 0;
+
+function wrapPhase(name, fn) {
+  return async function wrappedPhase(...args) {
+    const nested = phaseDepth > 0;
+    phaseDepth += 1;
+    const span = latency.startSpan('phase.' + name, { kind: 'phase', nested });
+    try {
+      const value = await fn(...args);
+      span.end({ ok: !(value && value.error), telemetry_dropped: getTelemetryDropped() });
+      return value;
+    } catch (error) {
+      span.fail(error, { telemetry_dropped: getTelemetryDropped() });
+      throw error;
+    } finally {
+      phaseDepth -= 1;
+    }
+  };
+}
+
+propose = wrapPhase('propose', propose);
+reviewProposal = wrapPhase('reviewProposal', reviewProposal);
+autoAdvance = wrapPhase('autoAdvance', autoAdvance);
+autoApprove = wrapPhase('autoApprove', autoApprove);
+consult = wrapPhase('consult', consult);
+execute = wrapPhase('execute', execute);
+reviewResult = wrapPhase('reviewResult', reviewResult);
+invokeEvaluator = wrapPhase('invokeEvaluator', invokeEvaluator);
+
+module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError, getTelemetryDropped, drainTelemetry };
+
+// Entry point runs last, after phase instrumentation is installed. main() is
+// async and starts executing immediately, so calling it any earlier would let
+// the first phase escape its span.
 if (require.main === module) {
   process.on('uncaughtException', (err) => {
     console.error('FATAL: ' + err.message);
@@ -1456,10 +1616,11 @@ if (require.main === module) {
     if (stack) console.error(stack);
     process.exit(1);
   });
-  main().catch(error => {
-    console.error('Error: ' + error.message);
-    process.exitCode = 1;
-  });
+  main()
+    .catch(error => {
+      console.error('Error: ' + error.message);
+      process.exitCode = 1;
+    })
+    // Pending telemetry appends hold the event loop, so this completes before exit.
+    .finally(() => drainTelemetry().catch(() => {}));
 }
-
-module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError, getTelemetryDropped };

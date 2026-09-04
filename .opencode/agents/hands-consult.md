@@ -1,7 +1,7 @@
 ---
 description: Bridge consultation gate. Confirms Brain guidance injected by the bridge; no MCP tools required.
 mode: primary
-model: local-router/bd/Deepseek-V4-Flash-0731
+model: opencode/muse-spark-1.2-contributor-free
 permission:
   "*": deny
   read: allow

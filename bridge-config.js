@@ -10,7 +10,7 @@ var PROVIDERS_FILE = 'providers.json';
 var LEGACY_BRAIN_FILE = 'brain.json';
 var OPENCODE_FILE = 'opencode.json';
 
-var BUILTIN_BRAIN_PROVIDERS = Object.freeze(['gemini', 'openrouter', 'groq', 'ollama', 'openai', 'anthropic']);
+var BUILTIN_BRAIN_PROVIDERS = Object.freeze(['gemini', 'openrouter', 'groq', 'ollama', 'openai', 'anthropic', 'zen']);
 
 var BRAIN_CONFIG_FIELDS = ['api_key', 'apiKey', 'model', 'baseURL', 'base_url', 'endpoint', 'timeout_ms'];
 

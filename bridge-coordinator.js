@@ -12,9 +12,13 @@ const { promisify } = require('node:util');
 const { defaultPolicy } = require('./bridge-policy');
 const { renameWithRetry } = require('./bridge-atomic');
 const { isLegacyConsultationRetry, coerceEventSeq, lastEvent } = require('./bridge-state');
+const latency = require('./bridge-latency');
 
 const execFileAsync = promisify(execFile);
 const root = process.cwd();
+// Only instrument when spawned as a command. Requiring the coordinator as a
+// library must not write telemetry.
+if (require.main === module) latency.install(root);
 const bridgeDir = path.join(root, '.bridge');
 const stateFile = path.join(bridgeDir, 'state.json');
 const eventsFile = path.join(bridgeDir, 'events.jsonl');
@@ -434,13 +438,18 @@ async function withLock(action) {
   }
 }
 
-async function gitSnapshot() {
+async function gitSnapshotInner() {
   let isRepo = false;
   try {
-    await execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd: root });
-    const prefix = await execFileAsync('git', ['rev-parse', '--show-prefix'], { cwd: root });
-    if (prefix.stdout.trim()) return { isRepo: false, head: null, dirty: false, status: [] };
-    isRepo = true;
+    // Toplevel and prefix in a single spawn. They exist only to confirm the
+    // bridge is operating at the repository root; asking separately doubled
+    // process-creation cost on the critical path of every approval. HEAD stays
+    // a separate call because it legitimately fails before the first commit,
+    // and a combined invocation would mask that as "not a repository".
+    const identity = await execFileAsync('git', ['rev-parse', '--show-toplevel', '--show-prefix'], { cwd: root });
+    const [toplevel = '', prefix = ''] = identity.stdout.split('\n');
+    if (String(prefix).trim()) return { isRepo: false, head: null, dirty: false, status: [] };
+    isRepo = Boolean(String(toplevel).trim());
   } catch {
     return { isRepo: false, head: null, dirty: false, status: [] };
   }
@@ -463,6 +472,20 @@ async function gitSnapshot() {
     lines = statusResult.stdout.split(/\r?\n/).filter(Boolean);
   } catch {}
   return { isRepo, head, dirty: lines.length > 0, status: lines };
+}
+
+// under_lock is the measurement that matters: gitSnapshot is called from inside
+// mutate(), so every millisecond here is spent holding state.lock.
+async function gitSnapshot() {
+  const span = latency.startSpan('git.snapshot', { kind: 'git', under_lock: stateLockDepth > 0 });
+  try {
+    const value = await gitSnapshotInner();
+    span.end({ ok: true, dirty: value.dirty, status_lines: value.status.length });
+    return value;
+  } catch (error) {
+    span.fail(error);
+    throw error;
+  }
 }
 
 function statusPaths(line) {
@@ -650,13 +673,16 @@ async function approve(summary) {
 }
 
 async function approveApproach(summary, mode = 'manual') {
+  // Sampled before the lock is taken. gitSnapshot never throws — it reports
+  // isRepo:false on failure — so every check below keeps its original order and
+  // error, we just stop holding state.lock across several git subprocesses.
+  const git = await gitSnapshot();
   return mutate('approach_approved', summary || 'MIND approved the HANDS approach', async next => {
     requirePhase(next, 'brain_approving');
     if (mode === 'manual' && next.autonomy?.mode === 'brain_autonomous') {
       throw new Error('Ordinary approval is disabled for autonomous Brain review; wait for Brain or provide explicit revised guidance.');
     }
     assertTransition(next.phase, 'hands_consulting');
-    const git = await gitSnapshot();
     if (!git.isRepo) throw new Error('Execution requires a Git repository. Run "git init" and create a baseline commit before approval.');
     if (!git.head) throw new Error('Execution requires a baseline Git commit before approval.');
     if (!(next.approach?.files || []).length) throw new Error('The approved approach must name at least one file.');
@@ -814,6 +840,8 @@ async function complete(args) {
   const leaseId = values.shift();
   const summary = values.join(' ').trim() || 'HANDS completed the approved chunk';
   if (!leaseId) throw new Error('An execution lease ID is required to complete the chunk.');
+  // Sampled before the lock is taken, as in approveApproach.
+  const git = await gitSnapshot();
   return mutate('chunk_completed', summary, async next => {
     requirePhase(next, 'hands_executing');
     if (next.execution_lease_id !== leaseId) {
@@ -822,7 +850,6 @@ async function complete(args) {
     if (!next.revision_consumed || !next.execution_lease_id || !next.execution_claimed) {
       throw new Error('Execution lease is missing or was not claimed; start the chunk through HANDS before completing it.');
     }
-    const git = await gitSnapshot();
     if (!git.isRepo) throw new Error('Execution verification requires a Git repository.');
     const changed = [...new Set(git.status.flatMap(statusPaths))];
     const headChanged = git.head !== next.git_before;

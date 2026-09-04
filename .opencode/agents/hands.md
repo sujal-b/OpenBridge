@@ -1,7 +1,7 @@
 ---
 description: Bridge execution agent. Edits only the approved chunk.
 mode: primary
-model: local-router/bd/Deepseek-V4-Flash-0731
+model: opencode/muse-spark-1.2-contributor-free
 permission:
   "*": deny
   read: allow

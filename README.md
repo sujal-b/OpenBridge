@@ -5,8 +5,8 @@ Brain handoffs, visibility, and one active agent at a time.
 
 ## Model routing
 
-- HANDS, HANDS-PROPOSE, and HANDS-EVALUATE use OpenCode Zen's current rolling alias: `opencode/deepseek-v4-flash-free`.
-- MIND and HANDS-to-MIND `ask_codex` guidance use `gpt-5.6-terra` with high reasoning.
+- HANDS, HANDS-PROPOSE, HANDS-CONSULT, and HANDS-EVALUATE use `opencode/muse-spark-1.2-contributor-free` (Zen, via `opencode run` subprocess).
+- MIND (Brain) uses `opencode/muse-spark-1.3-contributor-free` (Zen, via `opencode run` subprocess with the `brain` agent profile) — never direct HTTPS.
 
 ## Public commands
 
@@ -82,6 +82,32 @@ agent/action/risk/status cards, sanitized tool summaries, details on demand,
 and controls synchronized with the terminal. It shows waiting/stale connection status and prevents duplicate controls while one command is running. The Bridge is the only control surface; the agent panels are views. It does not start work by itself.
 
 Use `bridge policy` to view the project safety policy.
+
+## Latency instrumentation
+
+Every autonomous run records timing spans to `.bridge/latency.jsonl`: phase
+wall time (propose, consult, execute, review), provider process cold-start
+versus work time, Brain HTTP DNS/connect/TTFB/total with retry attempts,
+coordinator subprocess calls per chunk, prompt/response sizes, and git
+snapshots taken under the state lock.
+
+```powershell
+bridge latency              # P50/P95 per span, sorted by total time
+bridge latency --json       # machine-readable summary
+bridge latency --clear      # reset the collected data
+```
+
+Notes:
+
+- Spans are buffered in memory and flushed on a timer; the instrumentation
+  never takes the telemetry lock, so measuring a run does not change its
+  timing.
+- `phase.execute` includes `phase.reviewResult` when the run continues
+  autonomously; nested phases are marked `nested:true` in the raw spans.
+- `git.snapshot` reports `under_lock` — time spent in git while holding the
+  coordinator state lock.
+- The file rotates at 4 MB to `latency.jsonl.1`. Set `MIND_LIMB_LATENCY=0`
+  to disable recording entirely.
 
 ## Provider fallback
 
