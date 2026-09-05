@@ -1288,6 +1288,9 @@ async function spawnRunner(runnerArgs, cwd) {
     } catch {}
     const logPath = path.join(bridgeDir, 'runner.log');
     const outFd = fsSync.openSync(logPath, 'a');
+    // Hoisted so the readiness poll below can see it even when spawn fails
+    // (waitForRunnerReady treats null as "nothing to wait for").
+    let pid = null;
     try {
       const now = new Date().toISOString();
       fsSync.writeSync(outFd, '\n--- Runner started at ' + now + ' (args: ' + runnerArgs.join(' ') + ') ---\n');
@@ -1297,7 +1300,7 @@ async function spawnRunner(runnerArgs, cwd) {
         stdio: ['ignore', outFd, outFd],
         env: { ...process.env }
       });
-      const pid = child.pid;
+      pid = child.pid;
       if (pid) {
         fsSync.writeSync(outFd, '--- Runner PID: ' + pid + ' ---\n');
         await fs.writeFile(
@@ -1720,4 +1723,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive, waitForRunnerReady };
+module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive, waitForRunnerReady, spawnRunner };

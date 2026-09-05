@@ -7,7 +7,7 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
 
-const { waitForRunnerReady } = require('../bridge');
+const { waitForRunnerReady, spawnRunner } = require('../bridge');
 
 function stateLine(updatedAt) {
   return JSON.stringify({ updated_at: updatedAt }) + '\n';
@@ -147,5 +147,36 @@ test('readiness poll returns promptly when the runner dies before marking state'
     await waitForRunnerReady(bridgeDir, child.pid);
     const elapsed = Date.now() - started;
     assert.ok(elapsed < 2000, 'poll waited ' + elapsed + 'ms for an already-dead runner');
+  });
+});
+
+// Regression: the readiness-poll rollout referenced `pid` one block outside its
+// declaration, so every TTY-gated spawn (run/approve/revise/resume) died with
+// "ReferenceError: pid is not defined" right after the runner was detached —
+// invisible to CI because the gated CLI branch never runs there. Exercises the
+// real spawnRunner path; `status` exits immediately, so the poll resolves on
+// process death (or the store write, whichever lands first).
+test('spawnRunner detached-spawn path completes with the pid in scope', async () => {
+  await withBridgeDir(async (cwd, bridgeDir) => {
+    const started = Date.now();
+    await spawnRunner(['status'], cwd);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 5000, 'spawnRunner returned after ' + elapsed + 'ms — poll did not resolve');
+
+    const pidFile = JSON.parse(await fs.readFile(path.join(bridgeDir, 'runner.pid'), 'utf8'));
+    assert.ok(Number.isInteger(pidFile.pid) && pidFile.pid > 0, 'runner.pid missing a valid pid');
+
+    // The poll can return while the runner is still finishing its shutdown
+    // writes; on Windows its cwd keeps the workspace locked, so wait for a
+    // real exit before letting withBridgeDir delete the tree.
+    for (let waited = 0; waited < 5000; waited += 50) {
+      try {
+        process.kill(pidFile.pid, 0);
+      } catch {
+        break;
+      }
+      process.kill(pidFile.pid);
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
   });
 });
