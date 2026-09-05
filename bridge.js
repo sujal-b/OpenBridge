@@ -482,21 +482,30 @@ async function ensureGitRepo(cwd) {
 }
 
 async function prepareProject(cwd, options = {}) {
-  const autoMigrate = Boolean(options.autoMigrate || process.env.MIND_LIMB_BRIDGE_AUTO_MIGRATE === '1');
-  const gate = bridgeConfig.enforceVersionGate(cwd, { autoMigrate: autoMigrate });
-  if (gate.action === 'auto_migrate') {
-    await migrateProject(cwd, options);
-  } else if (gate.action === 'warn_custom') {
-    process.stderr.write(ANSI.warn + '  [WARN]  ' + ANSI.reset + gate.message + '\n');
-  }
+  const span = latency.startSpan('startup.prepare', { kind: 'phase' });
+  let gitignoreUpdated = false;
+  let createdProfiles = [];
+  try {
+    const autoMigrate = Boolean(options.autoMigrate || process.env.MIND_LIMB_BRIDGE_AUTO_MIGRATE === '1');
+    const gate = bridgeConfig.enforceVersionGate(cwd, { autoMigrate: autoMigrate });
+    if (gate.action === 'auto_migrate') {
+      await migrateProject(cwd, options);
+    } else if (gate.action === 'warn_custom') {
+      process.stderr.write(ANSI.warn + '  [WARN]  ' + ANSI.reset + gate.message + '\n');
+    }
 
-  await ensureGitRepo(cwd);
-  await invoke(coordinator, ['init'], cwd);
-  const gitignoreUpdated = await ensureGitignore(cwd);
-  const createdProfiles = await ensureLocalAgentProfiles(cwd);
-  await ensureBrainConfig(cwd);
-  await ensureOpencodeConfig(cwd);
-  await ensureProvidersConfig(cwd);
+    await ensureGitRepo(cwd);
+    await invoke(coordinator, ['init'], cwd);
+    gitignoreUpdated = await ensureGitignore(cwd);
+    createdProfiles = await ensureLocalAgentProfiles(cwd);
+    await ensureBrainConfig(cwd);
+    await ensureOpencodeConfig(cwd);
+    await ensureProvidersConfig(cwd);
+    span.end({});
+  } catch (error) {
+    span.fail(error);
+    throw error;
+  }
   process.stdout.write([
     ANSI.bold + ANSI.primary + '  Bridge  ' + ANSI.reset + ANSI.muted + 'project ready' + ANSI.reset,
     ANSI.muted + '  ' + cwd + ANSI.reset,
@@ -898,6 +907,7 @@ async function watch(cwd) {
   const render = async () => {
     if (closed || rendering) return;
     rendering = true;
+    const span = latency.startSpan('tui.render', { kind: 'phase' });
     try {
       let output;
       try {
@@ -919,6 +929,7 @@ async function watch(cwd) {
       process.stdout.write('\x1b[H\x1b[2J' + output + '\n');
     } finally {
       rendering = false;
+      span.end({});
     }
   };
 
@@ -1228,34 +1239,41 @@ function help() {
  * The runner writes progress to .bridge/state.json which watch() polls.
  */
 async function spawnRunner(runnerArgs, cwd) {
-  const bridgeDir = path.join(cwd, '.bridge');
-  await fs.mkdir(bridgeDir, { recursive: true });
-  const logPath = path.join(bridgeDir, 'runner.log');
-  const outFd = fsSync.openSync(logPath, 'a');
+  const span = latency.startSpan('startup.spawn_runner', { kind: 'phase' });
   try {
-    const now = new Date().toISOString();
-    fsSync.writeSync(outFd, '\n--- Runner started at ' + now + ' (args: ' + runnerArgs.join(' ') + ') ---\n');
-    const child = spawn(process.execPath, [runner, ...runnerArgs], {
-      cwd,
-      detached: true,
-      stdio: ['ignore', outFd, outFd],
-      env: { ...process.env }
-    });
-    const pid = child.pid;
-    if (pid) {
-      fsSync.writeSync(outFd, '--- Runner PID: ' + pid + ' ---\n');
-      await fs.writeFile(
-        path.join(bridgeDir, 'runner.pid'),
-        JSON.stringify({ pid, started_at: Date.now(), token: crypto.randomBytes(12).toString('hex') }) + '\n',
-        'utf8'
-      ).catch(() => {});
+    const bridgeDir = path.join(cwd, '.bridge');
+    await fs.mkdir(bridgeDir, { recursive: true });
+    const logPath = path.join(bridgeDir, 'runner.log');
+    const outFd = fsSync.openSync(logPath, 'a');
+    try {
+      const now = new Date().toISOString();
+      fsSync.writeSync(outFd, '\n--- Runner started at ' + now + ' (args: ' + runnerArgs.join(' ') + ') ---\n');
+      const child = spawn(process.execPath, [runner, ...runnerArgs], {
+        cwd,
+        detached: true,
+        stdio: ['ignore', outFd, outFd],
+        env: { ...process.env }
+      });
+      const pid = child.pid;
+      if (pid) {
+        fsSync.writeSync(outFd, '--- Runner PID: ' + pid + ' ---\n');
+        await fs.writeFile(
+          path.join(bridgeDir, 'runner.pid'),
+          JSON.stringify({ pid, started_at: Date.now(), token: crypto.randomBytes(12).toString('hex') }) + '\n',
+          'utf8'
+        ).catch(() => {});
+      }
+      child.unref();
+    } finally {
+      fsSync.closeSync(outFd);
     }
-    child.unref();
-  } finally {
-    fsSync.closeSync(outFd);
+    // Brief wait so runner can begin initializing state before watch reads it
+    await new Promise(resolve => setTimeout(resolve, 400));
+    span.end({});
+  } catch (error) {
+    span.fail(error);
+    throw error;
   }
-  // Brief wait so runner can begin initializing state before watch reads it
-  await new Promise(resolve => setTimeout(resolve, 400));
 }
 
 /** Prompt user for input. Returns trimmed string. */
@@ -1499,6 +1517,9 @@ async function main() {
   }
   if (command === 'new') return newProject(args);
   const cwd = projectPath(args);
+  // CLI-side spans (startup, TUI render) join the runner/coordinator spans in
+  // latency.jsonl. No-op for library requires and non-entry usage.
+  latency.install(cwd);
   if (command === 'open' || command === 'init') {
     const isCheck = args.includes('--check');
     const isMigrate = args.includes('--migrate');

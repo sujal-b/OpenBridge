@@ -3,6 +3,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { renameWithRetry } = require('./bridge-atomic');
+const latency = require('./bridge-latency');
 
 var MODULE_VERSION = 1;
 var PROVIDERS_DIR = '.bridge';
@@ -215,11 +216,18 @@ function removeHandsProvider(cwd, name) {
 }
 
 function getActiveHandsModel(cwd) {
+  const span = latency.startSpan('config.hands_model', { kind: 'config' });
   return loadProvidersJson(cwd).then(function(data) {
     if (data.hands && data.hands.active && data.hands.active.provider && data.hands.active.model) {
       return { provider: data.hands.active.provider, model: data.hands.active.model };
     }
     return null;
+  }).then(function(result) {
+    span.end({});
+    return result;
+  }, function(error) {
+    span.fail(error);
+    throw error;
   });
 }
 
@@ -276,7 +284,7 @@ function loadProvidersJsonSync(cwd) {
   }
 }
 
-function resolveActiveBrainProvider(cwd, options) {
+function resolveActiveBrainProviderInner(cwd, options) {
   options = options || {};
 
   // 1. Explicit options (highest precedence)
@@ -342,11 +350,23 @@ function resolveActiveBrainProvider(cwd, options) {
   return null;
 }
 
+function resolveActiveBrainProvider(cwd, options) {
+  const span = latency.startSpan('config.brain_provider', { kind: 'config' });
+  try {
+    const result = resolveActiveBrainProviderInner(cwd, options);
+    span.end({});
+    return result;
+  } catch (error) {
+    span.fail(error);
+    throw error;
+  }
+}
+
 function getActiveBrainProviderSync(cwd, options) {
   return resolveActiveBrainProvider(cwd, options);
 }
 
-function detectGenerationSync(cwd) {
+function detectGenerationSyncInner(cwd) {
   var projectDir = cwd || process.cwd();
   var providersPath = path.join(projectDir, PROVIDERS_DIR, PROVIDERS_FILE);
   var brainPath = path.join(projectDir, PROVIDERS_DIR, LEGACY_BRAIN_FILE);
@@ -446,6 +466,18 @@ function detectGenerationSync(cwd) {
     providersCorrupt: providersCorrupt,
     active: activeName || null
   };
+}
+
+function detectGenerationSync(cwd) {
+  const span = latency.startSpan('config.detect_generation', { kind: 'config' });
+  try {
+    const result = detectGenerationSyncInner(cwd);
+    span.end({});
+    return result;
+  } catch (error) {
+    span.fail(error);
+    throw error;
+  }
 }
 
 function detectGeneration(cwd) {

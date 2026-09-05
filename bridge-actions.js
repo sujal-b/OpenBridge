@@ -5,6 +5,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 
 const { renameWithRetry } = require('./bridge-atomic');
+const latency = require('./bridge-latency');
 const MAX_FIELD_LENGTH = 240;
 const MAX_ID_LENGTH = 120;
 const DEFAULT_LOCK_WAIT_MS = 10000;
@@ -158,7 +159,15 @@ async function nextSequence(cwd) {
 async function appendAction(event, options = {}) {
   const cwd = options.cwd || process.cwd();
   const file = actionFile(cwd);
-  const lock = await acquireLock(cwd, options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS);
+  const lockSpan = latency.startSpan('actions.lock_wait', { kind: 'lock' });
+  let lock;
+  try {
+    lock = await acquireLock(cwd, options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS);
+  } catch (error) {
+    lockSpan.fail(error);
+    throw error;
+  }
+  lockSpan.end({});
   try {
     const record = normalizeAction(event);
     record.seq = await nextSequence(cwd);

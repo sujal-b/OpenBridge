@@ -2,6 +2,7 @@
 
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const latency = require('./bridge-latency');
 
 const policyFileName = path.join('.bridge', 'policy.json');
 
@@ -23,10 +24,17 @@ function mergePolicy(value = {}) {
 }
 
 async function loadPolicy(cwd) {
+  const span = latency.startSpan('config.policy', { kind: 'config' });
   try {
-    return mergePolicy(JSON.parse(await fs.readFile(path.join(cwd, policyFileName), 'utf8')));
+    const policy = mergePolicy(JSON.parse(await fs.readFile(path.join(cwd, policyFileName), 'utf8')));
+    span.end({});
+    return policy;
   } catch (error) {
-    if (error.code === 'ENOENT') return mergePolicy();
+    if (error.code === 'ENOENT') {
+      span.end({ missing: true });
+      return mergePolicy();
+    }
+    span.fail(error);
     throw new Error('Invalid bridge policy: ' + error.message);
   }
 }
