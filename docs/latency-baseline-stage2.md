@@ -87,3 +87,25 @@ Per-command coordinator cost is now dispatch + file I/O only (no Node boot).
 The Stage-2 target ("`coord.*` <150 ms/chunk, `process.node` 7 → 1-2") is met:
 the three measured `coord.*` commands total ~45 ms, and the remaining
 `process.node` spawns belong to the agent transport.
+
+### Stage 3 — startup readiness (measured 2026-09-05)
+
+`prepareProject` now runs its idempotent writes concurrently and skips the
+coordinator `init` entirely when the store is already present (readiness =
+state.json + events.jsonl + plan.md + policy.json, mirroring `ensureStore`).
+The runner-side readiness poll replaced the fixed 400 ms TTY sleep: `spawnRunner`
+returns as soon as the runner's first coordinator command lands in state.json,
+when the runner dies, or at a 5 s cap (`MIND_LIMB_RUNNER_READY_MS` to override).
+Covered by `test/bridge-stage3-startup.test.js`.
+
+| Span | After Stage 2 | After Stage 3 | Delta |
+|---|---|---|---|
+| **All spans** | 2.47 s | **2.00–2.06 s** | **−~0.45 s (−18%)** |
+| `startup.prepare` | ~110 ms | 15–16 ms | −85% (init in-process + store-ready skip) |
+| `process.node` | 4 spawns, 963 ms | 3 spawns, 752–789 ms | Init subprocess gone |
+| `coord.*` (evaluate/activity/done) | 12–22 ms | 15–19 ms | unchanged, as intended |
+
+The readiness poll itself is TTY-only (the headless demo never sleeps on it);
+its unit tests pin the three exits — first state mark (<400 ms, proving the
+fixed sleep is gone), death, and cap — rather than a demo number. Cumulative
+from the Stage-0 baseline: 3.86–3.98 s → 2.00–2.06 s (−48%).

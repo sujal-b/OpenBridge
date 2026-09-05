@@ -17,6 +17,7 @@ const { renameWithRetry } = require('./bridge-atomic');
 
 const bridgeRoot = __dirname;
 const coordinator = path.join(bridgeRoot, 'bridge-coordinator.js');
+const coordinatorLib = require('./bridge-coordinator');
 const runner = path.join(bridgeRoot, 'bridge-runner.js');
 
 // ─── Semantic color system ────────────────────────────────────────────────────
@@ -495,12 +496,29 @@ async function prepareProject(cwd, options = {}) {
     }
 
     await ensureGitRepo(cwd);
-    await invoke(coordinator, ['init'], cwd);
-    gitignoreUpdated = await ensureGitignore(cwd);
-    createdProfiles = await ensureLocalAgentProfiles(cwd);
-    await ensureBrainConfig(cwd);
-    await ensureOpencodeConfig(cwd);
-    await ensureProvidersConfig(cwd);
+    // When the store is complete the init step is pure startup tax: the
+    // coordinator's ensureStore lazily completes any missing store file on the
+    // next command, including crash-journal reconciliation. The readiness
+    // predicate is the same four files ensureStore checks — directory
+    // existence is not enough, because latency flushes create .bridge/
+    // (latency.jsonl) independently of the store. For fresh or partial stores,
+    // init runs in-process, concurrently with the idempotent config writes —
+    // each writer creates its own directories, so there are no ordering
+    // dependencies between them.
+    const storeNames = ['state.json', 'events.jsonl', 'plan.md', 'policy.json'];
+    const storeReady = (await Promise.all(
+      storeNames.map(name => fs.access(path.join(cwd, '.bridge', name)).then(() => true, () => false))
+    )).every(Boolean);
+    const results = await Promise.all([
+      storeReady ? Promise.resolve(null) : coordinatorLib.handleCommand(['init'], { cwd }),
+      ensureGitignore(cwd),
+      ensureLocalAgentProfiles(cwd),
+      ensureBrainConfig(cwd),
+      ensureOpencodeConfig(cwd),
+      ensureProvidersConfig(cwd)
+    ]);
+    gitignoreUpdated = results[1];
+    createdProfiles = results[2];
     span.end({});
   } catch (error) {
     span.fail(error);
@@ -1234,6 +1252,29 @@ function help() {
   ].join('\n'));
 }
 
+// Bounded wait for a freshly spawned runner to make its first state mark. Resolves
+// on the first of: state.json's updated_at changing past `previousUpdated`, the
+// process dying, or the cap expiring. The cap (MIND_LIMB_RUNNER_READY_MS, default
+// 5 s) exists so a hung runner still hands control to watch(), which surfaces
+// failures from runner.log.
+async function waitForRunnerReady(bridgeDir, pid, options = {}) {
+  if (!pid) return;
+  const intervalMs = options.intervalMs ?? 25;
+  const envCap = Number(process.env.MIND_LIMB_RUNNER_READY_MS);
+  const capMs = options.capMs ?? (envCap > 0 ? envCap : 5000);
+  const stateFile = path.join(bridgeDir, 'state.json');
+  const previousUpdated = options.previousUpdated ?? null;
+  const deadline = Date.now() + capMs;
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, intervalMs));
+    if (!processAlive(pid)) break;
+    try {
+      const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+      if (state.updated_at && state.updated_at !== previousUpdated) break;
+    } catch {}
+  }
+}
+
 /**
  * Spawn bridge-runner in background (detached), then return — caller enters watch() immediately.
  * The runner writes progress to .bridge/state.json which watch() polls.
@@ -1243,6 +1284,12 @@ async function spawnRunner(runnerArgs, cwd) {
   try {
     const bridgeDir = path.join(cwd, '.bridge');
     await fs.mkdir(bridgeDir, { recursive: true });
+    // Baseline must be read before the child can write — otherwise a fast
+    // runner's first mark could be mistaken for the pre-existing state.
+    let previousUpdated = null;
+    try {
+      previousUpdated = JSON.parse(await fs.readFile(path.join(bridgeDir, 'state.json'), 'utf8')).updated_at;
+    } catch {}
     const logPath = path.join(bridgeDir, 'runner.log');
     const outFd = fsSync.openSync(logPath, 'a');
     try {
@@ -1267,8 +1314,9 @@ async function spawnRunner(runnerArgs, cwd) {
     } finally {
       fsSync.closeSync(outFd);
     }
-    // Brief wait so runner can begin initializing state before watch reads it
-    await new Promise(resolve => setTimeout(resolve, 400));
+    // Readiness poll instead of a fixed 400 ms sleep: return as soon as the
+    // runner touches state.json (its first coordinator command lands) or dies.
+    await waitForRunnerReady(bridgeDir, pid, { previousUpdated });
     span.end({});
   } catch (error) {
     span.fail(error);
@@ -1674,4 +1722,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive };
+module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive, waitForRunnerReady };
