@@ -137,6 +137,12 @@ coordinator consultation gate still validates the record). Set
 `MIND_LIMB_REQUIRE_CONSULT_CONFIRM = 1` to restore the extra HANDS-CONSULT
 round trip.
 
+Coordinator commands issued by the runner execute in-process (one Node process
+total instead of one boot per state mutation). The file-lock protocol is
+unchanged, so CLI, TUI, and inspector subprocess callers interleave safely. Set
+`MIND_LIMB_COORD_INPROCESS = 0` to force the runner back to spawning
+`bridge-coordinator.js` per command.
+
 Execution is not automatically retried because HANDS may have edited files
 before a timeout. Inspect first, then run:
 

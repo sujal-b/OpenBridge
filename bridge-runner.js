@@ -26,6 +26,7 @@ const root = process.cwd();
 // library (tests, inspector) must never write telemetry into anyone's .bridge/.
 if (require.main === module) latency.install(root);
 const coordinator = path.join(__dirname, 'bridge-coordinator.js');
+const coordinatorLib = require('./bridge-coordinator');
 const opencodeCommand = process.env.MIND_LIMB_OPENCODE_COMMAND || 'opencode';
 const sharedTimeoutMs = Number(process.env.MIND_LIMB_AGENT_TIMEOUT_MS);
 const defaultProposalTimeoutMs = Number.isFinite(sharedTimeoutMs) && sharedTimeoutMs > 0
@@ -368,17 +369,26 @@ async function readState(options = {}) {
 async function runCommand(args, options = {}) {
   const cwd = options.cwd || root;
   const processRunner = options.runProcess || runProcess;
+  // In-process dispatch removes a full Node boot per coordinator call (~8-12
+  // per chunk). MIND_LIMB_COORD_INPROCESS=0 restores subprocess mode; the
+  // file-lock protocol arbitrates both transports identically.
+  const subprocessMode = process.env.MIND_LIMB_COORD_INPROCESS === '0';
   const span = latency.startSpan('coord.' + String(args[0] || 'unknown'), {
     kind: 'coord',
-    command: String(args[0] || '')
+    command: String(args[0] || ''),
+    mode: subprocessMode ? 'subprocess' : 'inprocess'
   });
   try {
-    const result = await processRunner(process.execPath, [coordinator, ...args], {
-      cwd,
-      timeoutMs: 30000
-    });
-    if (!result.ok) {
-      throw new Error((result.stderr || result.stdout || 'Coordinator command failed').trim());
+    if (subprocessMode) {
+      const result = await processRunner(process.execPath, [coordinator, ...args], {
+        cwd,
+        timeoutMs: 30000
+      });
+      if (!result.ok) {
+        throw new Error((result.stderr || result.stdout || 'Coordinator command failed').trim());
+      }
+    } else {
+      await coordinatorLib.handleCommand(args, { cwd });
     }
     // readState can spawn the coordinator again when state.json is corrupt, so
     // it belongs inside the measured window.

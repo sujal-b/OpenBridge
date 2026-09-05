@@ -58,3 +58,32 @@ they surface in real TUI runs.
 | 2 | In-process coordinator | `coord.*` total ~1.2 s → <150 ms/chunk; `process.node` count 7 → 1-2 |
 | 3 | Readiness poll + parallel init | `startup.spawn_runner` 400 ms → <50 ms; `startup.prepare` shrinks |
 | 4 | Config cache, dead-snapshot removal, keep-alive, tail scans | `config.*` call count −50%+; `process.git` count down; Brain p50 drops by TLS handshake |
+
+## Stage deltas (measured after each stage, same method)
+
+### Stage 1 — protocol fast path (c69d19d)
+
+Removes one of ~7 LLM round trips on the direct-API Brain path. Not visible in
+the mock demo (its "LLM" calls cost 0 ms); the signal is the missing
+`agent.hands-consult` span on that path and one fewer provider round trip in
+real chunks. Guarded by `MIND_LIMB_REQUIRE_CONSULT_CONFIRM=1`.
+
+### Stage 2 — in-process coordinator (measured 2026-09-05)
+
+`bridge-coordinator.js` dispatch is now requireable (`handleCommand`), and the
+runner executes coordinator commands in-process by default
+(`MIND_LIMB_COORD_INPROCESS=0` restores subprocess mode). File-lock protocol,
+crash journal, and CLI/inspector subprocess paths unchanged.
+
+| Span | Baseline | After Stage 2 | Delta |
+|---|---|---|---|
+| **All spans** | 3.86–3.98 s | **2.47 s** | **−1.4–1.5 s (−37%)** |
+| `process.node` | 7 spawns, 1.69–1.74 s | 4 spawns, 963 ms | Coordinator boots gone; remainder are agent-transport spawns (real `opencode` processes in production, not bridge tax) |
+| `coord.done` | ~150 ms | 12–14 ms | −90% |
+| `coord.activity` | ~140 ms | 16–22 ms | −86% |
+| `coord.evaluate` | ~135 ms | 14–16 ms | −89% |
+
+Per-command coordinator cost is now dispatch + file I/O only (no Node boot).
+The Stage-2 target ("`coord.*` <150 ms/chunk, `process.node` 7 → 1-2") is met:
+the three measured `coord.*` commands total ~45 ms, and the remaining
+`process.node` spawns belong to the agent transport.

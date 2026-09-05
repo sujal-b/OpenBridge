@@ -20,11 +20,18 @@ async function withWorkspace(fn) {
     JSON.stringify({ phase: 'hands_executing', task: 't', session_id: 's1', assignment_id: 'a1', revision: 1, hands_session_id: 'hs1' }) + '\n',
     'utf8'
   );
+  // These tests observe the activity coalescer by intercepting coordinator
+  // subprocess calls; pin subprocess transport so the interception keeps
+  // working now that the runner defaults to in-process dispatch.
+  const previousCoordMode = process.env.MIND_LIMB_COORD_INPROCESS;
+  process.env.MIND_LIMB_COORD_INPROCESS = '0';
   try {
     return await fn(cwd);
   } finally {
     // Telemetry writes are fire-and-forget; let them settle before cleanup.
     await drainTelemetry().catch(() => {});
+    if (previousCoordMode === undefined) delete process.env.MIND_LIMB_COORD_INPROCESS;
+    else process.env.MIND_LIMB_COORD_INPROCESS = previousCoordMode;
     await fs.rm(cwd, { recursive: true, force: true });
   }
 }

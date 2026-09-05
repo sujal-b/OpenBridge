@@ -15,20 +15,35 @@ const { isLegacyConsultationRetry, coerceEventSeq, lastEvent } = require('./brid
 const latency = require('./bridge-latency');
 
 const execFileAsync = promisify(execFile);
-const root = process.cwd();
+// Paths are lets so configureProject() can re-point them when the coordinator
+// is driven in-process by the runner (handleCommand). Subprocess mode leaves
+// them at the spawned cwd.
+let root = process.cwd();
 // Only instrument when spawned as a command. Requiring the coordinator as a
 // library must not write telemetry.
 if (require.main === module) latency.install(root);
-const bridgeDir = path.join(root, '.bridge');
-const stateFile = path.join(bridgeDir, 'state.json');
-const eventsFile = path.join(bridgeDir, 'events.jsonl');
-const planFile = path.join(bridgeDir, 'plan.md');
-const policyFile = path.join(bridgeDir, 'policy.json');
-const initLockFile = path.join(bridgeDir, 'init.lock');
-const lockFile = path.join(bridgeDir, 'state.lock');
-const commitFile = path.join(bridgeDir, 'commit.pending.json');
+let bridgeDir = path.join(root, '.bridge');
+let stateFile = path.join(bridgeDir, 'state.json');
+let eventsFile = path.join(bridgeDir, 'events.jsonl');
+let planFile = path.join(bridgeDir, 'plan.md');
+let policyFile = path.join(bridgeDir, 'policy.json');
+let initLockFile = path.join(bridgeDir, 'init.lock');
+let lockFile = path.join(bridgeDir, 'state.lock');
+let commitFile = path.join(bridgeDir, 'commit.pending.json');
 
 let stateLockDepth = 0;
+
+function configureProject(cwd) {
+  root = cwd;
+  bridgeDir = path.join(root, '.bridge');
+  stateFile = path.join(bridgeDir, 'state.json');
+  eventsFile = path.join(bridgeDir, 'events.jsonl');
+  planFile = path.join(bridgeDir, 'plan.md');
+  policyFile = path.join(bridgeDir, 'policy.json');
+  initLockFile = path.join(bridgeDir, 'init.lock');
+  lockFile = path.join(bridgeDir, 'state.lock');
+  commitFile = path.join(bridgeDir, 'commit.pending.json');
+}
 
 const phases = new Set([
   'idle', 'planning', 'hands_proposing', 'brain_approving',
@@ -1037,8 +1052,8 @@ async function cancel(summary) {
     });
   }
 
-function printStatus(state) {
-  console.log([
+function statusText(state) {
+  return [
     'Phase: ' + state.phase,
     'Active: ' + state.active_agent,
     'Task: ' + (state.task || '(none)'),
@@ -1048,28 +1063,29 @@ function printStatus(state) {
     'Git: ' + state.git_status,
     'Last: ' + state.last_summary,
     'Updated: ' + state.updated_at
-  ].join('\n'));
+  ].join('\n');
 }
 
-async function printLog(limit) {
+async function logText(limit) {
   await ensureStore();
   const text = await fs.readFile(eventsFile, 'utf8');
   const lines = text.trim().split(/\r?\n/).filter(Boolean).slice(-(limit || 10));
+  const rendered = [];
   for (const line of lines) {
     try {
       const event = JSON.parse(line);
-      console.log('[' + event.at + '] ' + event.type + ' | ' + event.phase + ' | ' + event.summary);
+      rendered.push('[' + event.at + '] ' + event.type + ' | ' + event.phase + ' | ' + event.summary);
     } catch {
       // A reader can observe an incomplete final JSONL line during append.
     }
   }
+  return rendered.join('\n');
 }
 
 async function unlock() {
   const owner = await readLockOwner(lockFile);
   if (!owner) {
-    console.log('No coordinator lock found.');
-    return;
+    return 'No coordinator lock found.';
   }
   const pid = owner && Number(owner.pid);
   if (Number.isInteger(pid) && pid > 0 && processAlive(pid)) {
@@ -1081,11 +1097,11 @@ async function unlock() {
   await fs.unlink(lockFile).catch(error => {
     if (error.code !== 'ENOENT') throw error;
   });
-  console.log('Stale coordinator lock removed.');
+  return 'Stale coordinator lock removed.';
 }
 
 function help() {
-  console.log([
+  return [
     'Mind-Limb Bridge coordinator', '',
     'Commands:',
     '  init                         Create .bridge files',
@@ -1109,31 +1125,35 @@ function help() {
     '  status                       Show current state',
     '  log [count]                  Show recent audit entries',
     '  unlock                       Remove a stale coordinator lock'
-  ].join('\n'));
+  ].join('\n');
 }
 
-async function main() {
-  const args = process.argv.slice(2);
-  const command = args.shift() || 'help';
-  if (command === 'help') return help();
-  if (command === 'unlock') return unlock();
-  let result;
+// One command, transport-agnostic. Returns { text } for human-rendered reads
+// (help/status/log/unlock/init) or { state } for mutations; throws on failure.
+// The subprocess main() below and the runner's in-process handleCommand() both
+// consume this, so the two transports execute byte-identical logic.
+async function dispatchCommand(command, args) {
+  if (command === 'help') return { text: help() };
+  if (command === 'unlock') return { text: await unlock() };
   switch (command) {
-    case 'init': result = await readState(); console.log('Initialized ' + bridgeDir); break;
-    case 'start': result = await beginTask(args.join(' ')); break;
-    case 'approach': result = await submitApproach(args); break;
-    case 'bind-session': result = await bindHandsSession(args[0]); break;
-    case 'activity': result = await setActivity(args.shift(), args.join(' ')); break;
-    case 'claim-execution': result = await claimExecution(args[0]); break;
-    case 'approve': result = await approve(args.join(' ')); break;
+    case 'init': {
+      const state = await readState();
+      return { text: 'Initialized ' + bridgeDir + '\n' + statusText(state) };
+    }
+    case 'start': return { state: await beginTask(args.join(' ')) };
+    case 'approach': return { state: await submitApproach(args) };
+    case 'bind-session': return { state: await bindHandsSession(args[0]) };
+    case 'activity': return { state: await setActivity(args.shift(), args.join(' ')) };
+    case 'claim-execution': return { state: await claimExecution(args[0]) };
+    case 'approve': return { state: await approve(args.join(' ')) };
     case 'brain-approve':
-    case 'approve-auto': result = await brainApprove(args.join(' ')); break;
+    case 'approve-auto': return { state: await brainApprove(args.join(' ')) };
     case 'evaluate':
-    case 'evaluation': result = await recordEvaluation(args.join(' ')); break;
-    case 'consult': result = await approveConsultation(args.join(' ')); break;
-    case 'revise': result = await revise(args.join(' ')); break;
-    case 'continue': result = await continueChunk(args.join(' ')); break;
-    case 'complete': result = await complete(args); break;
+    case 'evaluation': return { state: await recordEvaluation(args.join(' ')) };
+    case 'consult': return { state: await approveConsultation(args.join(' ')) };
+    case 'revise': return { state: await revise(args.join(' ')) };
+    case 'continue': return { state: await continueChunk(args.join(' ')) };
+    case 'complete': return { state: await complete(args) };
     case 'block': {
       const marker = args.indexOf('--kind');
       const kind = marker >= 0 ? args[marker + 1] : null;
@@ -1141,34 +1161,62 @@ async function main() {
         if (!kind) throw new Error('--kind requires a value.');
         args.splice(marker, 2);
       }
-      result = await block(args.join(' '), kind);
-      break;
+      return { state: await block(args.join(' '), kind) };
     }
-    case 'recover': result = await recover(); break;
-    case 'resume': result = await resume(); break;
-    case 'pause': result = await pause(); break;
-    case 'done': result = await finish(args.join(' ')); break;
-    case 'cancel': result = await cancel(args.join(' ')); break;
-    case 'status': return printStatus(await readState());
-    case 'log': return printLog(Number(args[0]) || 10);
+    case 'recover': return { state: await recover() };
+    case 'resume': return { state: await resume() };
+    case 'pause': return { state: await pause() };
+    case 'done': return { state: await finish(args.join(' ')) };
+    case 'cancel': return { state: await cancel(args.join(' ')) };
+    case 'status': return { text: statusText(await readState()) };
+    case 'log': return { text: await logText(Number(args[0]) || 10) };
     default: throw new Error('Unknown command: ' + command);
   }
-  if (result) printStatus(result);
 }
 
-process.on('uncaughtException', (err) => {
-  console.error('FATAL: ' + err.message);
-  if (err.stack) console.error(err.stack);
-  process.exit(1);
-});
-process.on('unhandledRejection', (reason) => {
-  const msg = reason instanceof Error ? reason.message : String(reason);
-  const stack = reason instanceof Error ? reason.stack : '';
-  console.error('FATAL: ' + msg);
-  if (stack) console.error(stack);
-  process.exit(1);
-});
-main().catch(error => {
-  console.error('Error: ' + error.message);
-  process.exitCode = 1;
-});
+async function main() {
+  const args = process.argv.slice(2);
+  const command = args.shift() || 'help';
+  const outcome = await dispatchCommand(command, args);
+  if (outcome.text !== undefined) console.log(outcome.text);
+  else if (outcome.state) console.log(statusText(outcome.state));
+}
+
+let commandQueue = Promise.resolve();
+
+// In-process entry point for the runner: executes one coordinator command
+// against options.cwd without paying a Node process boot per call. Calls are
+// serialized through a promise queue so configureProject() cannot interleave
+// between concurrent callers; the file-lock protocol still arbitrates against
+// external subprocess callers exactly as before.
+async function handleCommand(args, options = {}) {
+  const cwd = options.cwd || process.cwd();
+  const run = () => {
+    configureProject(cwd);
+    return dispatchCommand(String(args[0] || 'help'), args.slice(1));
+  };
+  const outcome = commandQueue.then(run, run);
+  commandQueue = outcome.then(() => {}, () => {});
+  return outcome;
+}
+
+module.exports = { handleCommand };
+
+if (require.main === module) {
+  process.on('uncaughtException', (err) => {
+    console.error('FATAL: ' + err.message);
+    if (err.stack) console.error(err.stack);
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (reason) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : '';
+    console.error('FATAL: ' + msg);
+    if (stack) console.error(stack);
+    process.exit(1);
+  });
+  main().catch(error => {
+    console.error('Error: ' + error.message);
+    process.exitCode = 1;
+  });
+}
