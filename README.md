@@ -143,6 +143,14 @@ unchanged, so CLI, TUI, and inspector subprocess callers interleave safely. Set
 `MIND_LIMB_COORD_INPROCESS = 0` to force the runner back to spawning
 `bridge-coordinator.js` per command.
 
+Startup is also leaner: `bridge open` prepares the project concurrently and
+skips initialization when the store is already present, and `bridge run`
+returns the moment the runner's first state mark lands in `.bridge/state.json`
+(process death or a 5 s cap cut the wait short — set
+`MIND_LIMB_RUNNER_READY_MS` to widen the cap). Brain HTTP calls reuse one
+keep-alive TLS connection per host, and repeated config reads are served from
+an mtime-keyed cache, so per-chunk overhead stays flat as sessions grow.
+
 Execution is not automatically retried because HANDS may have edited files
 before a timeout. Inspect first, then run:
 
