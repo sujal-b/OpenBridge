@@ -173,6 +173,69 @@ test('Brain review can request the next chunk through revise', async () => {
     await fs.rm(cwd, { recursive: true, force: true });
   }
 });
+test('consult skips the hands-consult echo-confirm when Brain pre-approved via direct API', async () => {
+  const cwd = await createGitWorkspace('');
+  await fs.mkdir(path.join(cwd, '.bridge'), { recursive: true });
+  // Legacy brain.json resolves to the zen provider (viaOpencode), so the mocked
+  // runProcess doubles as the Brain transport: args[2] === 'brain'.
+  await fs.writeFile(path.join(cwd, '.bridge', 'brain.json'), JSON.stringify({ provider: 'zen' }), 'utf8');
+  const calls = [];
+  const mockedProcess = async (command, args, options) => {
+    calls.push({ command, args });
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    if (args[2] === 'brain') {
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ approved: true, guidance: 'Proceed with the approved chunk as specified.' }), stderr: '', timed_out: false };
+    }
+    const output = args[2] === 'hands-propose'
+      ? { decision: 'propose', summary: 'Validate before saving', files: ['src/save.js'], tests: ['node --test'], sessionID: 'hands-session-fast' }
+      : { decision: 'completed', summary: 'Validation added', files: ['src/save.js'], tests: ['node --test'], sessionID: 'hands-session-fast' };
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify(output), stderr: '', timed_out: false };
+  };
+  try {
+    await start('Add save validation', { cwd, runProcess: mockedProcess });
+    const executed = await approve('Approved by MIND', { cwd, runProcess: mockedProcess });
+    assert.equal(executed.state.phase, 'brain_reviewing');
+    assert.equal(executed.state.consultation.decision, 'approved');
+    assert.match(executed.state.consultation.brain_answer, /Proceed with the approved chunk/);
+    const agentArgs = calls.filter(call => !(call.command === process.execPath && call.args[0] === coordinator)).map(call => call.args[2]);
+    assert.deepEqual(agentArgs, ['hands-propose', 'brain', 'hands']);
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('MIND_LIMB_REQUIRE_CONSULT_CONFIRM=1 restores the hands-consult echo-confirm', async () => {
+  const cwd = await createGitWorkspace('');
+  await fs.mkdir(path.join(cwd, '.bridge'), { recursive: true });
+  await fs.writeFile(path.join(cwd, '.bridge', 'brain.json'), JSON.stringify({ provider: 'zen' }), 'utf8');
+  process.env.MIND_LIMB_REQUIRE_CONSULT_CONFIRM = '1';
+  const calls = [];
+  const mockedProcess = async (command, args, options) => {
+    calls.push({ command, args });
+    if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
+    if (args[2] === 'brain') {
+      return { ok: true, code: 0, signal: null, stdout: JSON.stringify({ approved: true, guidance: 'Proceed with the approved chunk as specified.' }), stderr: '', timed_out: false };
+    }
+    await markBrainConsultation(args, options);
+    const output = args[2] === 'hands-propose'
+      ? { decision: 'propose', summary: 'Validate before saving', files: ['src/save.js'], tests: ['node --test'], sessionID: 'hands-session-confirm' }
+      : args[2] === 'hands-consult'
+        ? consultationFor(args, 'hands-session-confirm')
+        : { decision: 'completed', summary: 'Validation added', files: ['src/save.js'], tests: ['node --test'], sessionID: 'hands-session-confirm' };
+    return { ok: true, code: 0, signal: null, stdout: JSON.stringify(output), stderr: '', timed_out: false };
+  };
+  try {
+    await start('Add save validation', { cwd, runProcess: mockedProcess });
+    const executed = await approve('Approved by MIND', { cwd, runProcess: mockedProcess });
+    assert.equal(executed.state.phase, 'brain_reviewing');
+    const agentArgs = calls.filter(call => !(call.command === process.execPath && call.args[0] === coordinator)).map(call => call.args[2]);
+    assert.deepEqual(agentArgs, ['hands-propose', 'brain', 'hands-consult', 'hands']);
+  } finally {
+    delete process.env.MIND_LIMB_REQUIRE_CONSULT_CONFIRM;
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
 test('start retries a proposal left in planning instead of restarting it', async () => {
   const cwd = await createGitWorkspace('');
   let agentCalls = 0;

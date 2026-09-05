@@ -1369,6 +1369,24 @@ async function consult(options = {}) {
           }
         }
         let attemptBrainConsulted = false;
+        // When Brain guidance arrived via the direct API it was already validated
+        // (parseBrainJson + approved===true), so the hands-consult call would only
+        // restate pre-validated JSON — a full provider round trip of ceremony.
+        // approveConsultation below stays the enforcement point;
+        // MIND_LIMB_REQUIRE_CONSULT_CONFIRM=1 restores the echo-confirm call.
+        if (brainGuidance && process.env.MIND_LIMB_REQUIRE_CONSULT_CONFIRM !== '1') {
+          latency.count('consult.fast_path', 1);
+          const result = {
+            decision: 'approved',
+            assignment_id: state.assignment_id,
+            revision: state.revision,
+            summary: 'Brain guidance confirmed via direct API consultation.',
+            brain_answer: String(brainGuidance.guidance || '').trim()
+          };
+          validateConsultation(result, state);
+          const next = await runCommand(['consult', JSON.stringify(result)], options);
+          return { state: next, result };
+        }
         const details = await invokeAgentWithRetry('hands-consult', consultationPrompt(state, brainGuidance), {
           ...options,
           timeoutMs: options.timeoutMs ?? defaultConsultTimeoutMs,

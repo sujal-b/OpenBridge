@@ -131,6 +131,12 @@ Optional PowerShell settings:
     $env:MIND_LIMB_MAX_CHUNK_FILES = 3
     $env:MIND_LIMB_BRIDGE_TIMEOUT_MS = 630000
 
+When Brain consultation succeeds through the direct API, the bridge skips the
+redundant HANDS echo-confirm call and mints the execution lease directly (the
+coordinator consultation gate still validates the record). Set
+`MIND_LIMB_REQUIRE_CONSULT_CONFIRM = 1` to restore the extra HANDS-CONSULT
+round trip.
+
 Execution is not automatically retried because HANDS may have edited files
 before a timeout. Inspect first, then run:
 
