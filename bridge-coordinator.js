@@ -12,6 +12,7 @@ const { promisify } = require('node:util');
 const { defaultPolicy } = require('./bridge-policy');
 const { renameWithRetry } = require('./bridge-atomic');
 const { isLegacyConsultationRetry, coerceEventSeq, lastEvent } = require('./bridge-state');
+const { readJsonlTail } = require('./bridge-read');
 const latency = require('./bridge-latency');
 
 const execFileAsync = promisify(execFile);
@@ -212,18 +213,12 @@ async function reconcilePending() {
   if (!pending.state || !pending.plan || !pending.event) throw new Error('Invalid pending bridge commit. Inspect ' + commitFile + '.');
   await writeJsonAtomic(stateFile, pending.state);
   await writeTextAtomic(planFile, pending.plan);
-  let hasEvent = false;
-  try {
-    const lines = (await fs.readFile(eventsFile, 'utf8')).split(/\r?\n/).filter(Boolean);
-    hasEvent = lines.some(line => {
-      try {
-        const event = JSON.parse(line);
-        return event.seq === pending.event.seq && event.session_id === pending.event.session_id;
-      } catch { return false; }
-    });
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
+  // The pending event, if the pre-crash commit got as far as appending it, is
+  // necessarily the last line: no later commit can have succeeded without
+  // reconciling this journal first, so a tail window is sufficient.
+  const tail = await readJsonlTail(eventsFile, { source: 'events.jsonl', maxBytes: 64 * 1024 });
+  const hasEvent = tail.values.some(event =>
+    event.seq === pending.event.seq && event.session_id === pending.event.session_id);
   if (!hasEvent) await fs.appendFile(eventsFile, JSON.stringify(pending.event) + '\n', 'utf8');
   await fs.unlink(commitFile).catch(error => {
     if (error.code !== 'ENOENT') throw error;
@@ -309,24 +304,6 @@ execution_started_at: state.execution_started_at ?? null
   // Only migrate that exact consultation state; material consultation blocks stay revisions.
   if (isLegacyConsultationRetry(normalized)) normalized.block_kind = 'consultation_retry';
   return normalized;
-}
-
-async function lastEventSeq() {
-  let maxSeq = -1;
-  try {
-    const lines = (await fs.readFile(eventsFile, 'utf8')).trim().split(/\r?\n/).filter(Boolean);
-    for (const line of lines) {
-      try {
-        const event = JSON.parse(line);
-        if (Number.isInteger(event.seq) && event.seq >= 0 && event.seq > maxSeq) maxSeq = event.seq;
-      } catch {
-        // Skip broken log tails; continuity is derived from valid events only.
-      }
-    }
-  } catch {
-    // No readable events file; a fresh log starts at zero.
-  }
-  return maxSeq;
 }
 
 async function reinitializeState() {
@@ -589,7 +566,14 @@ async function commit(next, type, summary, extra) {
   const plan = renderPlan(next);
   await writeJsonAtomic(commitFile, { state: next, plan, event });
   await writeJsonAtomic(stateFile, next);
-  await writeTextAtomic(planFile, plan);
+  // Most mutations leave the plan untouched; skip the temp-file write+rename
+  // when the rendered text is identical. Under the coordinator lock, so no
+  // concurrent writer can race the read-compare.
+  const currentPlan = await fs.readFile(planFile, 'utf8').catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (currentPlan !== plan) await writeTextAtomic(planFile, plan);
   await appendEvent(event);
   await fs.unlink(commitFile).catch(error => {
     if (error.code !== 'ENOENT') throw error;
@@ -1068,16 +1052,13 @@ function statusText(state) {
 
 async function logText(limit) {
   await ensureStore();
-  const text = await fs.readFile(eventsFile, 'utf8');
-  const lines = text.trim().split(/\r?\n/).filter(Boolean).slice(-(limit || 10));
+  const count = Number(limit) || 10;
+  // Window scales with the request so `bridge history N` still sees N events
+  // on long logs; bounded because the caller supplies N.
+  const tail = await readJsonlTail(eventsFile, { source: 'events.jsonl', maxBytes: Math.max(256 * 1024, count * 1024), limit: count });
   const rendered = [];
-  for (const line of lines) {
-    try {
-      const event = JSON.parse(line);
-      rendered.push('[' + event.at + '] ' + event.type + ' | ' + event.phase + ' | ' + event.summary);
-    } catch {
-      // A reader can observe an incomplete final JSONL line during append.
-    }
+  for (const event of tail.values) {
+    rendered.push('[' + event.at + '] ' + event.type + ' | ' + event.phase + ' | ' + event.summary);
   }
   return rendered.join('\n');
 }

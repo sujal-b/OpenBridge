@@ -6,6 +6,17 @@ const { parseStructuredResult, runProcess, buildOpencodeArgs } = require('./brid
 const { getActiveBrainProviderSync } = require('./bridge-config');
 const latency = require('./bridge-latency');
 
+// Chunk traffic hits one Brain host 6-7 times back to back; without keep-alive
+// every call pays a fresh TLS handshake (~100-300 ms). Idle sockets are
+// unref'd (agent 'free') so they never hold the runner's event loop open at
+// exit, and re-ref'd the moment a request claims one — the runner drains by
+// event-loop exhaustion, and its request timer is already unref'd, so an
+// in-flight request keeps the process alive only through its ref'd socket.
+var httpAgent = new http.Agent({ keepAlive: true });
+var httpsAgent = new https.Agent({ keepAlive: true });
+httpAgent.on('free', function(socket) { socket.unref(); });
+httpsAgent.on('free', function(socket) { socket.unref(); });
+
 function roundMs(value) {
   return Number.isFinite(value) ? Math.round(value * 100) / 100 : null;
 }
@@ -145,7 +156,7 @@ function httpPost(url, body, extraHeaders, timeoutMs) {
       });
     }
 
-    var req = lib.request({ method: 'POST', hostname: urlObj.hostname, port: urlObj.port || (isHttp ? 80 : 443), path: urlObj.pathname + urlObj.search, headers: reqHeaders }, function(res) {
+    var req = lib.request({ method: 'POST', hostname: urlObj.hostname, port: urlObj.port || (isHttp ? 80 : 443), path: urlObj.pathname + urlObj.search, headers: reqHeaders, agent: isHttp ? httpAgent : httpsAgent }, function(res) {
       ttfbMs = latency.now() - startedAt;
       var data = '';
       res.on('data', function(chunk) { data += chunk; });
@@ -179,6 +190,7 @@ function httpPost(url, body, extraHeaders, timeoutMs) {
       });
     });
     req.on('socket', function(socket) {
+      socket.ref();
       socket.once('lookup', function() { dnsMs = latency.now() - startedAt; });
       socket.once('connect', function() { connectMs = latency.now() - startedAt; });
     });
@@ -394,4 +406,4 @@ async function brainReviewResult(state, execution, evaluation, options) {
   return result;
 }
 
-module.exports = { callBrain, brainConsultChunk, brainReviewProposal, brainReviewResult, resolveConfig, PROVIDERS };
+module.exports = { callBrain, brainConsultChunk, brainReviewProposal, brainReviewResult, resolveConfig, PROVIDERS, httpPost };

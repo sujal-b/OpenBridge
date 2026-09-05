@@ -1,7 +1,7 @@
 'use strict';
 
-const fs = require('node:fs/promises');
 const path = require('node:path');
+const { readJsonlTail } = require('./bridge-read');
 
 // Strict form classifies tool-name fields; loose form handles provider ids such as toolu_ask_codex.
 const TOOL_NAME = /(?<![a-z0-9_])ask[_.-]?codex(?![a-z0-9_])/i;
@@ -84,16 +84,14 @@ function coerceEventSeq(raw) {
 }
 
 async function lastEvent(cwd) {
+  // Event seq is monotonic, so the max-seq event is always in the tail window;
+  // init/repair paths call this on logs that grow for the whole session.
+  const tail = await readJsonlTail(path.join(cwd || process.cwd(), '.bridge', 'events.jsonl'), { source: 'events.jsonl', maxBytes: 64 * 1024 });
   let max = null;
-  let session_id = null;
-  try {
-    const text = await fs.readFile(path.join(cwd, '.bridge', 'events.jsonl'), 'utf8');
-    for (const line of text.trim().split(/\r?\n/).filter(Boolean)) {
-      try { const event = JSON.parse(line); if (Number.isInteger(event.seq) && event.seq >= 0 && (!max || event.seq > max.seq)) max = event; } catch {}
-    }
-    session_id = max?.session_id || null;
-  } catch {}
-  return { seq: max?.seq ?? -1, session_id };
+  for (const event of tail.values) {
+    if (Number.isInteger(event.seq) && event.seq >= 0 && (!max || event.seq > max.seq)) max = event;
+  }
+  return { seq: max?.seq ?? -1, session_id: max?.session_id || null };
 }
 
 module.exports = { TOOL_NAME, ID_MARKER, isBrainConsultationEvent, hasAskCodexToken, isLegacyConsultationRetry, coerceEventSeq, lastEvent };

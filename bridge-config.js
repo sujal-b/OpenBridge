@@ -3,6 +3,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { renameWithRetry } = require('./bridge-atomic');
+const { readTextCached, readTextCachedSync, invalidate: invalidateFsCache } = require('./bridge-fscache');
 const latency = require('./bridge-latency');
 
 var MODULE_VERSION = 1;
@@ -21,7 +22,7 @@ function emptyProviders() {
 
 function loadProvidersJson(cwd) {
   var filePath = path.join(cwd || process.cwd(), PROVIDERS_DIR, PROVIDERS_FILE);
-  return fs.readFile(filePath, 'utf8').then(function(raw) {
+  return readTextCached(filePath).then(function(raw) {
     try {
       var data = JSON.parse(raw.replace(/^\uFEFF/, '').trim());
       if (!data || typeof data !== 'object') return emptyProviders();
@@ -50,6 +51,9 @@ function saveProvidersJson(cwd, data) {
     return fs.writeFile(tmpPath, json, 'utf8');
   }).then(function() {
     return renameWithRetry(tmpPath, filePath);
+  }).then(function() {
+    invalidateFsCache(filePath);
+    return data;
   }).catch(function(err) {
     return fs.unlink(tmpPath).catch(function() {}).then(function() { throw err; });
   });
@@ -189,6 +193,8 @@ function addHandsProvider(cwd, name, config) {
     throw err;
   }).then(function() {
     return renameWithRetry(tmpPath, configPath);
+  }).then(function() {
+    invalidateFsCache(configPath);
   }).catch(function(err) {
     return fs.unlink(tmpPath).catch(function() {}).then(function() { throw err; });
   });
@@ -210,6 +216,8 @@ function removeHandsProvider(cwd, name) {
     return fs.writeFile(tmpPath, JSON.stringify(data, null, 2) + '\n', 'utf8');
   }).then(function() {
     return renameWithRetry(tmpPath, configPath);
+  }).then(function() {
+    invalidateFsCache(configPath);
   }).catch(function(err) {
     return fs.unlink(tmpPath).catch(function() {}).then(function() { throw err; });
   });
@@ -257,7 +265,7 @@ function validateProviderConfig(name, config) {
 
 function loadLegacyBrainConfig(cwd) {
   var filePath = path.join(cwd || process.cwd(), PROVIDERS_DIR, LEGACY_BRAIN_FILE);
-  return fs.readFile(filePath, 'utf8').then(function(raw) {
+  return readTextCached(filePath).then(function(raw) {
     try {
       return JSON.parse(raw.replace(/^\uFEFF/, '').trim());
     } catch (e) {
@@ -272,7 +280,7 @@ function loadLegacyBrainConfig(cwd) {
 function loadProvidersJsonSync(cwd) {
   var filePath = path.join(cwd || process.cwd(), PROVIDERS_DIR, PROVIDERS_FILE);
   try {
-    var raw = require('node:fs').readFileSync(filePath, 'utf8');
+    var raw = readTextCachedSync(filePath);
     var data = JSON.parse(raw.replace(/^\uFEFF/, '').trim());
     if (!data || typeof data !== 'object') return emptyProviders();
     if (!data.brain || typeof data.brain !== 'object') data.brain = { active: null, custom: {} };
@@ -326,7 +334,7 @@ function resolveActiveBrainProviderInner(cwd, options) {
   // 3. Legacy brain.json
   try {
     var legacyPath = path.join(cwd || process.cwd(), PROVIDERS_DIR, LEGACY_BRAIN_FILE);
-    var raw = require('node:fs').readFileSync(legacyPath, 'utf8');
+    var raw = readTextCachedSync(legacyPath);
     var legacy = JSON.parse(raw.replace(/^\uFEFF/, '').trim());
     if (legacy && legacy.provider) {
       return {
@@ -380,7 +388,7 @@ function detectGenerationSyncInner(cwd) {
   var providersCorrupt = false;
 
   try {
-    var rawProviders = require('node:fs').readFileSync(providersPath, 'utf8');
+    var rawProviders = readTextCachedSync(providersPath);
     providersExists = true;
     try {
       providersData = JSON.parse(rawProviders.replace(/^\uFEFF/, '').trim());
@@ -390,7 +398,7 @@ function detectGenerationSyncInner(cwd) {
   } catch (e) { /* ENOENT */ }
 
   try {
-    var rawBrain = require('node:fs').readFileSync(brainPath, 'utf8');
+    var rawBrain = readTextCachedSync(brainPath);
     brainExists = true;
     try {
       brainData = JSON.parse(rawBrain.replace(/^\uFEFF/, '').trim());
@@ -398,7 +406,7 @@ function detectGenerationSyncInner(cwd) {
   } catch (e) { /* ENOENT */ }
 
   try {
-    var rawState = require('node:fs').readFileSync(statePath, 'utf8');
+    var rawState = readTextCachedSync(statePath);
     try {
       stateData = JSON.parse(rawState.replace(/^\uFEFF/, '').trim());
     } catch (e) {}

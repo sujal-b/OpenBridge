@@ -109,3 +109,35 @@ The readiness poll itself is TTY-only (the headless demo never sleeps on it);
 its unit tests pin the three exits — first state mark (<400 ms, proving the
 fixed sleep is gone), death, and cap — rather than a demo number. Cumulative
 from the Stage-0 baseline: 3.86–3.98 s → 2.00–2.06 s (−48%).
+
+### Stage 4 — I/O & hot-path polish (measured 2026-09-05)
+
+- **Keep-alive Brain HTTP** (`bridge-brain.js`): shared `http`/`https` agents
+  reuse one TLS connection per host across a chunk's 6-7 Brain calls. Idle
+  sockets are unref'd (agent `free`) so the runner still drains at exit;
+  re-ref'd on assignment so in-flight requests hold the loop.
+- **Dead evaluator snapshots removed**: `invokeEvaluator` computed
+  approved-file + working-tree snapshots that nothing consumed — `reviewResult`
+  takes its own before/after pair around the whole call.
+- **Config mtime cache** (`bridge-fscache.js`): providers/policy/brain reads
+  become a stat on repeat reads; writers invalidate. Removes up to 5 sync reads
+  per `detectGenerationSync` and double reads per agent invoke.
+- **Tail reads** (`bridge-read.js`): `lastEvent`, `reconcilePending`'s journal
+  dedupe check, the 401 loop detector, `log`, and `migrateProject` now read a
+  bounded tail window instead of the whole events.jsonl (monotonic seq ⇒ tail
+  suffices; the dead full-scan `lastEventSeq` was deleted).
+- **`commit()` skips the plan.md rewrite** when the rendered plan is
+  unchanged (under the coordinator lock, so the read-compare cannot race).
+
+| Span | After Stage 3 | After Stage 4 | Delta |
+|---|---|---|---|
+| **All spans** | 2.00–2.06 s | **1.81 s** | **−0.2 s (−10%)** |
+| `phase.invokeEvaluator` | 164 ms | 99 ms | −40% (dead snapshots) |
+| `config.brain_provider` | 4 calls, ~5 ms | 4 calls, ~1 ms | cache hits |
+| `config.hands_model` | 2 calls, ~3 ms | 2 calls, ~1 ms | cache hits |
+| `coord.*` | 12–22 ms | 14–21 ms | unchanged (plan.md skip within noise) |
+
+Keep-alive and tail reads do not surface in the mock demo (no real TLS, logs
+are tiny); on real workloads they remove a per-call TLS handshake and keep
+audit-log scans bounded as sessions grow. Cumulative from baseline:
+3.86–3.98 s → 1.81 s (−54%).

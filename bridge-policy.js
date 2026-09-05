@@ -1,7 +1,7 @@
 'use strict';
 
-const fs = require('node:fs/promises');
 const path = require('node:path');
+const { readTextCached } = require('./bridge-fscache');
 const latency = require('./bridge-latency');
 
 const policyFileName = path.join('.bridge', 'policy.json');
@@ -26,7 +26,9 @@ function mergePolicy(value = {}) {
 async function loadPolicy(cwd) {
   const span = latency.startSpan('config.policy', { kind: 'config' });
   try {
-    const policy = mergePolicy(JSON.parse(await fs.readFile(path.join(cwd, policyFileName), 'utf8')));
+    // Loaded at multiple phase boundaries per chunk; the mtime-keyed cache
+    // turns repeats into a stat.
+    const policy = mergePolicy(JSON.parse(await readTextCached(path.join(cwd, policyFileName))));
     span.end({});
     return policy;
   } catch (error) {

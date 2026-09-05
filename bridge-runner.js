@@ -9,6 +9,7 @@ const { getActiveHandsModel, getActiveBrainProviderSync, detectGenerationSync } 
 const { appendAction } = require('./bridge-actions');
 const { loadPolicy, classifyAction, resolvePolicyMode, policyGate } = require('./bridge-policy');
 const { isBrainConsultationEvent, isLegacyConsultationRetry } = require('./bridge-state');
+const { readJsonlTail } = require('./bridge-read');
 const { brainConsultChunk, brainReviewProposal, brainReviewResult } = require('./bridge-brain');
 const latency = require('./bridge-latency');
 
@@ -108,16 +109,15 @@ async function runPassiveAfterChecks(state, options = {}) {
     if (state && (state.phase === 'blocked_user' || state.phase === 'cancelled')) {
       const isAuthError = reason => /401|unauthorized|invalid.*(?:key|token)/i.test(String(reason || ''));
       if (isAuthError(state.blocked_reason)) {
-        const eventsRaw = await fs.readFile(path.join(cwd, '.bridge', 'events.jsonl'), 'utf8').catch(() => '');
-        const lines = eventsRaw.trim().split(/\r?\n/).filter(Boolean);
+        // Monotonic seq means the detector only ever needs the tail; the
+        // full-file scan this replaced grows with session length.
+        const tail = await readJsonlTail(path.join(cwd, '.bridge', 'events.jsonl'), { source: 'events.jsonl', maxBytes: 64 * 1024 });
         let authCount = 0;
-        for (let i = lines.length - 1; i >= 0 && i >= lines.length - 15; i--) {
-          try {
-            const ev = JSON.parse(lines[i]);
-            if (isAuthError(ev.reason || ev.blocked_reason || ev.summary)) {
-              authCount++;
-            }
-          } catch {}
+        for (let i = tail.values.length - 1; i >= 0 && i >= tail.values.length - 15; i--) {
+          const ev = tail.values[i];
+          if (isAuthError(ev.reason || ev.blocked_reason || ev.summary)) {
+            authCount++;
+          }
         }
         if (authCount >= 2) {
           process.stderr.write(
@@ -1010,8 +1010,6 @@ function snapshotsEqual(left, right) {
 
 async function invokeEvaluator(state, execution, options = {}) {
   const preferred = options.evaluatorAgent || 'hands-evaluate';
-  const beforeEvaluation = await snapshotApprovedFiles(state, options.cwd || root);
-  const beforeTree = await snapshotWorkingTree(options.cwd || root);
   const invoke = agent => withAgentLock(options, agent, () => invokeAgentWithRetry(
     agent,
     evaluationPrompt(state, execution && execution.result || execution),

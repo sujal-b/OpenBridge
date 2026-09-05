@@ -422,16 +422,12 @@ async function migrateProject(cwd, options = {}) {
   const eventsPath = path.join(cwd, '.bridge', 'events.jsonl');
   try {
     await fs.access(eventsPath);
+    // Monotonic seq: the max lives in the tail window.
+    const tail = await readJsonlTail(eventsPath, { source: 'events.jsonl', maxBytes: 64 * 1024 });
     let maxSeq = -1;
-    try {
-      const rawEvents = await fs.readFile(eventsPath, 'utf8');
-      for (const line of rawEvents.trim().split(/\r?\n/).filter(Boolean)) {
-        try {
-          const ev = JSON.parse(line);
-          if (Number.isInteger(ev.seq) && ev.seq > maxSeq) maxSeq = ev.seq;
-        } catch {}
-      }
-    } catch {}
+    for (const ev of tail.values) {
+      if (Number.isInteger(ev.seq) && ev.seq > maxSeq) maxSeq = ev.seq;
+    }
     const migrationEvent = JSON.stringify({
       seq: maxSeq + 1,
       event: 'migration',
