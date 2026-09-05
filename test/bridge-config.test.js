@@ -23,6 +23,7 @@ const {
   removeHandsProvider,
   getActiveHandsModel,
   setActiveHandsModel,
+  DEFAULT_HANDS_MODEL,
   validateProviderConfig,
 } = require('../bridge-config');
 
@@ -42,7 +43,7 @@ describe('bridge-config', () => {
   describe('loadProvidersJson', () => {
     it('returns empty structure when .bridge/providers.json does not exist', async () => {
       const data = await loadProvidersJson(cwd);
-      assert.deepStrictEqual(data, { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: null } });
+      assert.deepStrictEqual(data, { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: { ...DEFAULT_HANDS_MODEL } } });
     });
 
     it('reads existing providers.json correctly', async () => {
@@ -65,7 +66,7 @@ describe('bridge-config', () => {
 
       const data = await loadProvidersJson(cwd);
       assert.deepStrictEqual(data.brain, { custom: {} });
-      assert.deepStrictEqual(data.hands, { active: null });
+      assert.deepStrictEqual(data.hands, { active: { ...DEFAULT_HANDS_MODEL } });
     });
 
     it('rejects corrupt JSON with providers_corrupt code', async () => {
@@ -486,17 +487,15 @@ describe('bridge-config', () => {
   // ── getActiveHandsModel ───────────────────────────────────────────
 
   describe('getActiveHandsModel', () => {
-    it('returns null when no hands model is configured', async () => {
-      const result = await getActiveHandsModel(cwd);
-      // After setActiveHandsModel test above, it might be set, so load fresh state
+    it('returns the default hands model when none is configured', async () => {
       const dir = path.join(cwd, '.bridge');
       await fs.writeFile(
         path.join(dir, 'providers.json'),
         JSON.stringify({ brain: { active: null, custom: {} }, hands: { active: null } }),
         'utf8'
       );
-      const result2 = await getActiveHandsModel(cwd);
-      assert.equal(result2, null);
+      const result = await getActiveHandsModel(cwd);
+      assert.deepStrictEqual(result, { ...DEFAULT_HANDS_MODEL });
     });
 
     it('returns provider and model when configured', async () => {
@@ -552,7 +551,7 @@ describe('bridge-config', () => {
       const tempCwd = await fs.mkdtemp(path.join(os.tmpdir(), 'bridge-config-sync-'));
       try {
         const data = loadProvidersJsonSync(tempCwd);
-        assert.deepStrictEqual(data, { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: null } });
+        assert.deepStrictEqual(data, { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: { ...DEFAULT_HANDS_MODEL } } });
       } finally {
         await fs.rm(tempCwd, { recursive: true, force: true });
       }

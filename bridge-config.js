@@ -16,8 +16,19 @@ var BUILTIN_BRAIN_PROVIDERS = Object.freeze(['gemini', 'openrouter', 'groq', 'ol
 
 var BRAIN_CONFIG_FIELDS = ['api_key', 'apiKey', 'model', 'baseURL', 'base_url', 'endpoint', 'timeout_ms'];
 
+// Default Hands agent model, applied whenever providers.json carries no active
+// entry. Keeps `bridge config` display, agent spawn (--model), and the
+// opencode agent profile in agreement instead of relying on a hidden profile
+// fallback. Fresh copies via defaultHandsActive() so callers can mutate what
+// they received without touching the template.
+var DEFAULT_HANDS_MODEL = Object.freeze({ provider: 'opencode', model: 'muse-spark-1.2-contributor-free' });
+
+function defaultHandsActive() {
+  return { provider: DEFAULT_HANDS_MODEL.provider, model: DEFAULT_HANDS_MODEL.model };
+}
+
 function emptyProviders() {
-  return { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: null } };
+  return { version: MODULE_VERSION, brain: { active: null, custom: {} }, hands: { active: defaultHandsActive() } };
 }
 
 function loadProvidersJson(cwd) {
@@ -28,7 +39,8 @@ function loadProvidersJson(cwd) {
       if (!data || typeof data !== 'object') return emptyProviders();
       if (!data.brain || typeof data.brain !== 'object') data.brain = { active: null, custom: {} };
       if (!data.brain.custom || typeof data.brain.custom !== 'object') data.brain.custom = {};
-      if (!data.hands || typeof data.hands !== 'object') data.hands = { active: null };
+      if (!data.hands || typeof data.hands !== 'object') data.hands = { active: defaultHandsActive() };
+      if (!data.hands.active) data.hands.active = defaultHandsActive();
       return data;
     } catch (e) {
       throw Object.assign(new Error('Corrupt providers.json: ' + e.message), { code: 'providers_corrupt' });
@@ -285,7 +297,8 @@ function loadProvidersJsonSync(cwd) {
     if (!data || typeof data !== 'object') return emptyProviders();
     if (!data.brain || typeof data.brain !== 'object') data.brain = { active: null, custom: {} };
     if (!data.brain.custom || typeof data.brain.custom !== 'object') data.brain.custom = {};
-    if (!data.hands || typeof data.hands !== 'object') data.hands = { active: null };
+    if (!data.hands || typeof data.hands !== 'object') data.hands = { active: defaultHandsActive() };
+    if (!data.hands.active) data.hands.active = defaultHandsActive();
     return data;
   } catch (e) {
     return emptyProviders();
@@ -549,5 +562,6 @@ module.exports = {
   removeHandsProvider: removeHandsProvider,
   getActiveHandsModel: getActiveHandsModel,
   setActiveHandsModel: setActiveHandsModel,
+  DEFAULT_HANDS_MODEL: DEFAULT_HANDS_MODEL,
   validateProviderConfig: validateProviderConfig
 };

@@ -118,7 +118,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge execution agent. Edits only the approved chunk.',
     'mode: primary',
-    'model: opencode/muse-spark-1.2-contributor-free',
+    'model: ' + bridgeConfig.DEFAULT_HANDS_MODEL.provider + '/' + bridgeConfig.DEFAULT_HANDS_MODEL.model,
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -145,7 +145,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge read-only proposal agent.',
     'mode: primary',
-    'model: opencode/muse-spark-1.2-contributor-free',
+    'model: ' + bridgeConfig.DEFAULT_HANDS_MODEL.provider + '/' + bridgeConfig.DEFAULT_HANDS_MODEL.model,
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -168,7 +168,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge consultation gate. Confirms Brain guidance injected by the bridge.',
     'mode: primary',
-    'model: opencode/muse-spark-1.2-contributor-free',
+    'model: ' + bridgeConfig.DEFAULT_HANDS_MODEL.provider + '/' + bridgeConfig.DEFAULT_HANDS_MODEL.model,
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -191,7 +191,7 @@ const localAgentProfiles = {
     '---',
     'description: Bridge read-only evaluator. Reviews one completed HANDS chunk.',
     'mode: primary',
-    'model: opencode/muse-spark-1.2-contributor-free',
+    'model: ' + bridgeConfig.DEFAULT_HANDS_MODEL.provider + '/' + bridgeConfig.DEFAULT_HANDS_MODEL.model,
     'permission:',
     '  "*": deny',
     '  read: allow',
@@ -314,7 +314,7 @@ async function ensureProvidersConfig(cwd) {
     const initial = {
       version: bridgeConfig.MODULE_VERSION,
       brain: { active: 'zen', custom: {} },
-      hands: { active: null }
+      hands: { active: { ...bridgeConfig.DEFAULT_HANDS_MODEL } }
     };
     await fs.writeFile(file, JSON.stringify(initial, null, 2) + '\n', 'utf8');
     return true;
@@ -1369,7 +1369,9 @@ async function config(cwd, args) {
 
   if (sub === 'show' || sub === '') {
     // ── Show current config ──────────────────────────────────────────────
-    const activeBrain = await bridgeConfig.getActiveBrainProvider(cwd);
+    // Brain resolves to null in a project with no providers.json/brain.json/env;
+    // the display must render "(none)" rather than crash on it.
+    const activeBrain = (await bridgeConfig.getActiveBrainProvider(cwd)) || { name: null, builtin: false, config: null };
     const activeHandsModel = await bridgeConfig.getActiveHandsModel(cwd);
 
     const lines = [
