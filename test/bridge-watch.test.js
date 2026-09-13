@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
-const { readJsonLines, readState, setRepairRunner, controlsFor, controlAllowed, runnerIsAlive } = require('../bridge');
+const { readJsonLines, readState, setRepairRunner, controlsFor, controlAllowed, runnerIsAlive, hasWatchStateChanged } = require('../bridge');
 
 test('bridge watch reads only a bounded tail of long JSONL logs', async () => {
   const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-limb-watch-'));
@@ -152,4 +152,36 @@ test('runner liveness reads legacy bare-pid files', async () => {
   } finally {
     await fs.rm(cwd, { recursive: true, force: true });
   }
+});
+
+test('hasWatchStateChanged detects state transitions and suppresses unchanged idle ticks', () => {
+  const initial = {
+    stateKey: JSON.stringify({ phase: 'blocked_user', block_kind: 'consultation_retry' }),
+    eventCount: 5,
+    actionCount: 2,
+    lastEventSeq: 5,
+    lastActionSeq: 2,
+    notice: '',
+    runnerAlive: true
+  };
+
+  // Initial render (no previous snapshot) must report changed
+  assert.equal(hasWatchStateChanged(null, initial), true);
+
+  // Exact identical snapshot on next timer tick must report unchanged
+  assert.equal(hasWatchStateChanged(initial, { ...initial }), false);
+
+  // Changes to any monitored dimension must trigger stateChanged:
+  assert.equal(hasWatchStateChanged(initial, { ...initial, stateKey: JSON.stringify({ phase: 'hands_consulting' }) }), true);
+  assert.equal(hasWatchStateChanged(initial, { ...initial, eventCount: 6, lastEventSeq: 6 }), true);
+  assert.equal(hasWatchStateChanged(initial, { ...initial, actionCount: 3, lastActionSeq: 3 }), true);
+  assert.equal(hasWatchStateChanged(initial, { ...initial, notice: 'Steered: check config' }), true);
+  assert.equal(hasWatchStateChanged(initial, { ...initial, runnerAlive: false }), true);
+});
+
+test('bridge.js watch only records tui.render span when stateChanged is true', async () => {
+  const bridgeCli = path.resolve(__dirname, '..', 'bridge.js');
+  const source = await fs.readFile(bridgeCli, 'utf8');
+  // Verify span.end({}) is guarded by stateChanged check
+  assert.match(source, /if\s*\(stateChanged\)\s*\{\s*span\.end\(\{\}\);?\s*\}/);
 });

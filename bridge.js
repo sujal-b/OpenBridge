@@ -943,16 +943,30 @@ function renderSessionError(error) {
   return ANSI.error + '  No bridge session. Run: bridge open .' + ANSI.reset + '\n' + ANSI.muted + '  ' + error.message + ANSI.reset;
 }
 
+function hasWatchStateChanged(prev, current) {
+  if (!prev) return true;
+  return prev.stateKey !== current.stateKey
+    || prev.eventCount !== current.eventCount
+    || prev.actionCount !== current.actionCount
+    || prev.lastEventSeq !== current.lastEventSeq
+    || prev.lastActionSeq !== current.lastActionSeq
+    || prev.notice !== current.notice
+    || prev.runnerAlive !== current.runnerAlive;
+}
+
 async function watch(cwd) {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('bridge watch needs an interactive terminal.');  let closed = false;
+  if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('bridge watch needs an interactive terminal.');
+  let closed = false;
   let busy = false;
   let steerActive = false;
   let timer;
   let notice = '';
   let rendering = false;
+  let lastSnapshot = null;
   const render = async () => {
     if (closed || rendering) return;
     rendering = true;
+    let stateChanged = false;
     const span = latency.startSpan('tui.render', { kind: 'phase' });
     try {
       let output;
@@ -967,15 +981,45 @@ async function watch(cwd) {
         if (ACTIVE_PHASES.has(state.phase)) {
           runnerAlive = await runnerIsAlive(cwd);
         }
+        const eventCount = events.length;
+        const actionCount = actions.length;
+        const snapshot = {
+          stateKey: JSON.stringify(state),
+          eventCount,
+          actionCount,
+          lastEventSeq: eventCount > 0 ? events[eventCount - 1]?.seq : null,
+          lastActionSeq: actionCount > 0 ? actions[actionCount - 1]?.seq : null,
+          notice,
+          runnerAlive
+        };
+        if (hasWatchStateChanged(lastSnapshot, snapshot)) {
+          stateChanged = true;
+          lastSnapshot = snapshot;
+        }
         output = renderDashboard(state, events, cwd, actions, runnerAlive);
       } catch (error) {
+        const snapshot = {
+          stateKey: 'error:' + (error && error.code) + ':' + (error && error.message),
+          eventCount: 0,
+          actionCount: 0,
+          lastEventSeq: null,
+          lastActionSeq: null,
+          notice,
+          runnerAlive: false
+        };
+        if (hasWatchStateChanged(lastSnapshot, snapshot)) {
+          stateChanged = true;
+          lastSnapshot = snapshot;
+        }
         output = renderSessionError(error);
       }
       if (notice) output += '\n\n' + ANSI.warn + '  ' + shorten(notice, 100) + ANSI.reset;
       process.stdout.write('\x1b[H\x1b[2J' + output + '\n');
     } finally {
       rendering = false;
-      span.end({});
+      if (stateChanged) {
+        span.end({});
+      }
     }
   };
 
@@ -1774,4 +1818,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive, waitForRunnerReady, spawnRunner };
+module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive, waitForRunnerReady, spawnRunner, hasWatchStateChanged };
