@@ -112,8 +112,13 @@ Notes:
 ## Provider fallback
 
 Read-only HANDS proposals retry once by default after transient provider
-failures, invalid structured output, or timeouts. Retries reuse a discovered
-provider session. Code execution is not blindly replayed after a failure;
+failures, invalid structured output, or timeouts. A hard provider fault
+(HTTP 5xx, `UnknownError`, server crash) drops the poisoned session and
+retries with a **fresh session** — reusing a session that just server-faulted
+reproduces the fault. Provider error payloads are humanized before they reach
+the state record: you see `Provider server error: UnknownError — Unexpected
+server error (ref err_...)` instead of a raw JSON blob, and the provider ref
+stays for debugging. Code execution is not blindly replayed after a failure;
 the bridge escalates it for user inspection first.
 
 OpenCode JSON mode is an event stream. The bridge unwraps the final decision
@@ -144,8 +149,11 @@ unchanged, so CLI, TUI, and inspector subprocess callers interleave safely. Set
 `bridge-coordinator.js` per command.
 
 Startup is also leaner: `bridge open` prepares the project concurrently and
-skips initialization when the store is already present, and `bridge run`
-returns the moment the runner's first state mark lands in `.bridge/state.json`
+skips initialization when the store is already present, and`bridge run` auto-resumes a blocked session (dirty tree, provider failures,
+revisions pending): `run` means "continue", always. The only refusals carry
+their remedy: `bridge recover` after interrupted execution, or a decision
+(`bridge revise` / `bridge done`) after a policy escalation or material
+proposal blocker. `bridge run` returns the moment the runner's first state mark lands in `.bridge/state.json`
 (process death or a 5 s cap cut the wait short — set
 `MIND_LIMB_RUNNER_READY_MS` to widen the cap). Brain HTTP calls reuse one
 keep-alive TLS connection per host, and repeated config reads are served from
@@ -177,6 +185,48 @@ Recovery refuses to change state while a live provider lock exists. Stale locks
 are only removed when ownership is proven dead or the user explicitly requests
 stale-lock cleanup.
 
+## Working tree and Git ownership
+
+The bridge never commits your own work. It manages only the tree churn its own
+execution produced:
+
+- **Before a chunk runs** (proposal preflight and the approval gate), the tree
+  must be clean. The block lists the offending files (first 10), so stray
+  `.env` files, editor droppings, or unrelated edits are self-diagnosing.
+  The one-step remedy is `bridge resume --commit "checkpoint"` — it commits
+  your changes and resumes in the same command (custom message optional;
+  a user-staged index is never swept in). The proposal still stands and
+  no re-proposal is needed. `bridge revise` is refused at this block because
+  it cannot clean a tree.
+- **Bridge-owned scaffold never blocks.** Files the bridge itself created
+  (`opencode.json` via `bridge open`/`new`) are recorded with a content hash in
+  `.bridge/scaffold.json` and auto-committed when still untracked and unchanged.
+  If you edit a scaffold file, it becomes yours — it blocks like any other
+  dirt and the `resume --commit` remedy applies. Runtime data directories
+  (`.omo/`, `.opencode/`, `.claude/`, …) are exempt without a manifest.
+- **Agent/tool runtime data is exempt.** Untracked files under known agent
+  and tool runtime directories (`.omo/`, `.claude/`, `.cursor/`, `.codex/`,
+  and others — the runtime hosting the HANDS session writes
+  `.omo/run-continuation/*.json` mid-session) never count as dirt: not at the
+  gate, not in the completion scope check, not in the auto-commit. Tracked
+  changes inside those directories still block. For other generated paths,
+  add them to `.gitignore` or to `approval.ignorePaths` in
+  `.bridge/policy.json`; `bridge new`/`open` scaffold the known ones.
+- **Revision cycles are hands-free.** When the Brain rejects a chunk result,
+  the rejected attempt's own changes may stay in the tree: re-proposal,
+  re-approval, and re-execution tolerate them as long as HEAD sits on the
+  chunk baseline and every dirty file is inside the chunk's accumulated
+  approved scope. Anything you add — or a commit you make mid-cycle — snaps
+  the strict clean-tree rule back on.
+- **Accepted chunks are auto-committed.** When the Brain accepts a chunk
+  result (or you confirm with `bridge done`), exactly the chunk's accepted
+  files are committed as `bridge(chunk): <task>`. Your own staging is never
+  swept in (the commit is skipped instead), and files outside the chunk scope
+  stay uncommitted for you to handle. With no Git identity configured, the
+  commit falls back to a `mind-limb-bridge` identity.
+
+You stay on the keyboard only for work that is genuinely yours.
+
 ## Safety and records
 
 - `.bridge/state.json` is the authoritative state.
@@ -186,7 +236,10 @@ stale-lock cleanup.
 - `.bridge/policy.json` stores safe defaults and project overrides.
 - `.bridge/agent.lock` prevents parallel HANDS calls.
 - The HANDS session ID is preserved across chunks.
-- A dirty Git tree blocks the Brain <-> HANDS execution handoff; non-Git projects cannot enter execution.
+- A dirty Git tree blocks the Brain <-> HANDS execution handoff as a `dirty_tree`
+  block that `bridge resume` re-enters after cleanup; a revision cycle tolerates
+  its own attempt's changes, and accepted chunks are auto-committed (see
+  "Working tree and Git ownership"). Non-Git projects cannot enter execution.
 - Changed files are checked against the approved file list, including untracked,
   deleted, renamed, and out-of-scope paths.
 - Provider failures can be resumed; material proposal blockers require bridge revise.

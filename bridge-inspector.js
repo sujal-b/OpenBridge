@@ -22,7 +22,7 @@ function allowedControls(state) {
   const consultationRetry = phase === 'blocked_user' && blockKind === 'consultation_retry';
   return [
     phase === 'brain_approving' && !autonomous && 'approve',
-    ((phase === 'brain_approving' || phase === 'brain_reviewing') ? !autonomous : (phase === 'blocked_user' && !recoveryRequired && !consultationRetry && ['planning', 'hands_proposing', 'hands_consulting'].includes(resumePhase))) && 'revise',
+    ((phase === 'brain_approving' || phase === 'brain_reviewing') ? !autonomous : (phase === 'blocked_user' && blockKind !== 'dirty_tree' && !recoveryRequired && !consultationRetry && ['planning', 'hands_proposing', 'hands_consulting'].includes(resumePhase))) && 'revise',
     phase === 'brain_reviewing' && !autonomous && 'done',
     ['planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'brain_reviewing', 'blocked_user'].includes(phase) && 'pause',
     ['paused', 'blocked_user'].includes(phase) && !recoveryRequired && !['needs_revision', 'escalation'].includes(blockKind) && 'resume',

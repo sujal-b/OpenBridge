@@ -5,6 +5,7 @@
 // Audit only: .bridge/events.jsonl
 
 const fs = require('node:fs/promises');
+const fssync = require('node:fs');
 const crypto = require('node:crypto');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
@@ -52,7 +53,59 @@ const phases = new Set([
   'done', 'cancelled'
 ]);
 
-const blockKinds = new Set(['needs_revision', 'consultation_retry', 'escalation']);
+const blockKinds = new Set(['needs_revision', 'consultation_retry', 'escalation', 'dirty_tree', 'provider_fault']);
+
+// Stable prefix of every dirty-tree failure message. The runner classifies the
+// approval-gate failure into a dirty_tree block by matching this prefix, because
+// error codes do not survive the subprocess dispatch boundary ('Error: ' is
+// prepended there).
+const DIRTY_TREE_MESSAGE_PREFIX = 'Working tree is already dirty.';
+
+// Agent/tool runtime directories write session and cache data into the project
+// while a session is live (for example .omo/run-continuation/*.json, written by
+// the runtime hosting the HANDS session). That data is never source, so untracked
+// files under these prefixes are exempt from every tree check — gate, preflight,
+// completion scope, auto-commit — and a tool can never block its own session.
+// Tracked changes under these prefixes are NOT exempt: content changes always
+// block. Projects extend the list via approval.ignorePaths in .bridge/policy.json.
+const DEFAULT_RUNTIME_DIRS = [
+  '.bridge/', '.opencode/', '.omo/', '.zcode/',
+  '.claude/', '.codex/', '.cursor/', '.aider', '.gemini/', '.windsurf/',
+  '.continue/', '.serena/', '.copilot/', '.qwen/', '.crush/'
+];
+
+function treeIgnorePaths(cwd = root) {
+  const paths = [...DEFAULT_RUNTIME_DIRS];
+  try {
+    const policy = JSON.parse(fssync.readFileSync(path.join(cwd, '.bridge', 'policy.json'), 'utf8'));
+    const extra = policy && policy.approval && policy.approval.ignorePaths;
+    if (Array.isArray(extra)) {
+      for (const item of extra) {
+        const normalized = String(item || '').trim().replace(/\\/g, '/');
+        if (normalized) paths.push(normalized);
+      }
+    }
+  } catch {}
+  return paths;
+}
+
+// Splits porcelain status lines into what counts as dirt and what is exempt
+// tool runtime data. Only untracked lines ('??') can be exempt; staged,
+// modified, and deleted entries are content changes and always block.
+function splitTreeLines(lines, ignorePaths = DEFAULT_RUNTIME_DIRS) {
+  const prefixes = ignorePaths.map(item => repoPath(item)).filter(Boolean);
+  const blocking = [];
+  const exempt = [];
+  for (const line of lines) {
+    const filePath = statusPaths(line)[0];
+    const exempted = line.startsWith('??') && filePath && prefixes.some(prefix => {
+      const normalized = repoPath(filePath);
+      return normalized && normalized.startsWith(prefix);
+    });
+    (exempted ? exempt : blocking).push(line);
+  }
+  return { blocking, exempt };
+}
 
 const transitions = {
   idle: ['planning', 'cancelled'],
@@ -464,7 +517,10 @@ async function gitSnapshotInner() {
     );
     lines = statusResult.stdout.split(/\r?\n/).filter(Boolean);
   } catch {}
-  return { isRepo, head, dirty: lines.length > 0, status: lines };
+  // Exempt tool runtime data before anyone downstream sees it: dirty counting,
+  // the completion scope check, and git_status all operate on blocking lines.
+  const split = splitTreeLines(lines, treeIgnorePaths(root));
+  return { isRepo, head, dirty: split.blocking.length > 0, status: split.blocking, exempt: split.exempt };
 }
 
 // under_lock is the measurement that matters: gitSnapshot is called from inside
@@ -612,6 +668,7 @@ async function beginTask(task) {
     next.git_before = null;
     next.git_after = null;
     next.git_status = 'unknown';
+    next.attempt_scope = [];
     next.blocked_reason = null;
     next.block_kind = null;
     next.recovery_required = false;
@@ -623,14 +680,23 @@ async function beginTask(task) {
 }
 
 
-async function bindHandsSession(sessionId) {
+async function bindHandsSession(sessionId, options = {}) {
   if (!sessionId) throw new Error('A HANDS session ID is required.');
   return mutate('hands_session_bound', 'HANDS session bound for sequential continuation', next => {
     if (!['planning', 'hands_proposing', 'brain_approving', 'hands_consulting', 'hands_executing', 'brain_reviewing'].includes(next.phase)) {
       throw new Error('Cannot bind a HANDS session during phase ' + next.phase + '.');
     }
     if (next.hands_session_id && next.hands_session_id !== sessionId) {
-      throw new Error('A different HANDS session is already bound; refusing to fork the conversation.');
+      // Recovery path: the bound session died with a provider fault and the
+      // runner mints a replacement. Only allowed before any execution started
+      // (planning/proposal phases) — a mid-execution rebind could desync the
+      // conversation that owns the current chunk's edits.
+      const rebindAllowed = options.rebind === true
+        && ['planning', 'hands_proposing'].includes(next.phase)
+        && !next.execution_claimed;
+      if (!rebindAllowed) {
+        throw new Error('A different HANDS session is already bound; refusing to fork the conversation.');
+      }
     }
     if (next.phase === 'hands_executing' && !next.hands_session_id) {
       throw new Error('Cannot bind a new HANDS session during execution.');
@@ -686,7 +752,29 @@ async function approveApproach(summary, mode = 'manual') {
     if (!git.isRepo) throw new Error('Execution requires a Git repository. Run "git init" and create a baseline commit before approval.');
     if (!git.head) throw new Error('Execution requires a baseline Git commit before approval.');
     if (!(next.approach?.files || []).length) throw new Error('The approved approach must name at least one file.');
-    if (git.dirty) throw new Error('Working tree is already dirty. Commit or stash unrelated changes before approval.');
+    // Chunk lineage: beginTask/continueChunk clear attempt_scope and revise()
+    // preserves it, so a non-empty scope means a rejected attempt is being
+    // re-worked. That attempt's own changes may stay in the tree across the
+    // revision cycle; the HEAD guard closes the carve-out the moment the user
+    // commits (history ownership moved back to them, strict rules resume).
+    const priorScope = Array.isArray(next.attempt_scope) ? next.attempt_scope : [];
+    const priorBaseline = next.git_before;
+    const dirtyPaths = git.status.flatMap(statusPaths).map(repoPath).filter(Boolean);
+    const revisionCycle = priorScope.length > 0 && priorBaseline && git.head === priorBaseline;
+    const scopeSet = new Set(priorScope);
+    const withinChunkScope = dirtyPaths.every(p => scopeSet.has(p));
+    next.attempt_scope = [...new Set([...priorScope, ...(next.approach.files || []).map(repoPath).filter(Boolean)])];
+    if (git.dirty && !(revisionCycle && withinChunkScope)) {
+      const listed = git.status.slice(0, 10).map(line => '  ' + line);
+      const more = git.status.length > 10 ? '\n  … and ' + (git.status.length - 10) + ' more' : '';
+      const allUntracked = git.status.every(line => line.startsWith('??'));
+      const hint = allUntracked
+        ? '\nUntracked agent/tool runtime data is exempt automatically. For other generated paths, add them to .gitignore or to approval.ignorePaths in .bridge/policy.json.'
+        : '';
+      throw new Error(DIRTY_TREE_MESSAGE_PREFIX + ' Commit or stash unrelated changes before approval.\n'
+        + 'Dirty files (first ' + Math.min(10, git.status.length) + '):\n' + listed.join('\n') + more + hint
+        + '\nQuick fix: bridge resume --commit "checkpoint"  (commits your changes and resumes in one step)');
+    }
     next.phase = 'hands_consulting';
     next.active_agent = 'hands-consult';
     next.activity = { agent: 'hands-consult', action: 'Consulting Brain before execution', started_at: now() };
@@ -704,7 +792,7 @@ async function approveApproach(summary, mode = 'manual') {
     next.execution_started_at = null;
     next.git_before = git.head;
     next.git_after = null;
-    next.git_status = 'clean_before_execution';
+    next.git_status = git.dirty ? 'changes_present' : 'clean_before_execution';
     next.block_kind = null;
   });
 }
@@ -791,6 +879,12 @@ async function revise(summary) {
   const feedback = summary || 'User requested an approach revision';
   return mutate('approach_revision_requested', feedback, next => {
     // ponytail: allow mid-flight steering from any active phase directly to hands_proposing
+    if (next.phase === 'blocked_user' && next.block_kind === 'dirty_tree') {
+      // A revision re-runs the proposal pipeline and lands on the same tree
+      // precondition; the blocker lists the files and resume re-enters without
+      // a new proposal, so steer clear of the dead-end round trip.
+      throw new Error('Revise cannot clean a working tree. Commit or stash the files listed in the block, then run bridge resume.');
+    }
     if (['idle', 'done', 'cancelled'].includes(next.phase)) {
       throw new Error('Cannot steer or revise when session is ' + next.phase + '.');
     }
@@ -831,6 +925,7 @@ async function continueChunk(summary) {
     next.block_kind = null;
     next.recovery_required = false;
     next.resume_phase = null;
+    next.attempt_scope = [];
     next.evaluation = { status: 'idle', summary: null, at: null };
   });
 }
@@ -853,7 +948,13 @@ async function complete(args) {
     if (!git.isRepo) throw new Error('Execution verification requires a Git repository.');
     const changed = [...new Set(git.status.flatMap(statusPaths))];
     const headChanged = git.head !== next.git_before;
-    const approved = new Set((next.approach?.files || []).map(repoPath).filter(Boolean));
+    // Across a revision cycle the chunk's footprint is the accumulated scope
+    // (attempt N may touch files attempt N-1 did); approach.files alone would
+    // flag the earlier attempt's own files as violations.
+    const scope = Array.isArray(next.attempt_scope) && next.attempt_scope.length
+      ? next.attempt_scope
+      : (next.approach?.files || []);
+    const approved = new Set(scope.map(repoPath).filter(Boolean));
     const outOfScope = changed.filter(file => !approved.has(repoPath(file)));
     next.git_after = git.head;
     if (headChanged || outOfScope.length) {
@@ -1123,7 +1224,11 @@ async function dispatchCommand(command, args) {
     }
     case 'start': return { state: await beginTask(args.join(' ')) };
     case 'approach': return { state: await submitApproach(args) };
-    case 'bind-session': return { state: await bindHandsSession(args[0]) };
+    case 'bind-session': {
+      const rebind = args.includes('--rebind');
+      const id = args.filter(a => a !== '--rebind')[0];
+      return { state: await bindHandsSession(id, { rebind }) };
+    }
     case 'activity': return { state: await setActivity(args.shift(), args.join(' ')) };
     case 'claim-execution': return { state: await claimExecution(args[0]) };
     case 'approve': return { state: await approve(args.join(' ')) };
@@ -1181,7 +1286,7 @@ async function handleCommand(args, options = {}) {
   return outcome;
 }
 
-module.exports = { handleCommand };
+module.exports = { handleCommand, DIRTY_TREE_MESSAGE_PREFIX, statusPaths, repoPath, treeIgnorePaths, splitTreeLines, DEFAULT_RUNTIME_DIRS };
 
 if (require.main === module) {
   process.on('uncaughtException', (err) => {

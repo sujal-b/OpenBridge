@@ -299,9 +299,33 @@ async function ensureOpencodeConfig(cwd) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
     await fs.writeFile(file, JSON.stringify(defaultOpencodeConfig, null, 2) + '\n', 'utf8');
+    await rememberScaffoldFile(cwd, 'opencode.json', JSON.stringify(defaultOpencodeConfig, null, 2) + '\n');
     return true;
   }
   return false;
+}
+
+// Scaffold provenance: files the bridge itself created (opencode.json) are
+// recorded with a content hash in .bridge/scaffold.json. The runner's dirty-tree
+// preflight auto-commits scaffold files that are still untracked and unchanged,
+// so freshly scaffolded projects never block on the bridge's own configuration
+// files. User-authored files are never listed here and never auto-committed.
+async function rememberScaffoldFile(cwd, relPath, contents) {
+  try {
+    const manifestPath = path.join(cwd, '.bridge', 'scaffold.json');
+    let manifest = { version: 1, files: {} };
+    try {
+      manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+      if (!manifest.files || typeof manifest.files !== 'object') manifest.files = {};
+    } catch {}
+    manifest.version = 1;
+    manifest.files[relPath] = {
+      sha256: crypto.createHash('sha256').update(String(contents)).digest('hex'),
+      created_at: new Date().toISOString()
+    };
+    await fs.mkdir(path.dirname(manifestPath), { recursive: true });
+    await fs.writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8');
+  } catch {}
 }
 
 async function ensureProvidersConfig(cwd) {
@@ -445,7 +469,13 @@ async function migrateProject(cwd, options = {}) {
 
 async function ensureGitignore(cwd) {
   const file = path.join(cwd, '.gitignore');
-  const required = ['.bridge/', '.opencode/', 'node_modules/', 'dist/'];
+  // The bridge's own runtime dirs plus common agent tooling — their session
+  // and cache data must never count as project dirt (mirrors the coordinator's
+  // runtime exemption, which covers projects scaffolded before this list).
+  const required = [...new Set([
+    '.bridge/', '.opencode/', 'node_modules/', 'dist/',
+    ...coordinatorLib.DEFAULT_RUNTIME_DIRS
+  ])];
   let contents = '';
   try {
     contents = await fs.readFile(file, 'utf8');
@@ -454,7 +484,7 @@ async function ensureGitignore(cwd) {
   }
   const newline = contents.includes('\r\n') ? '\r\n' : '\n';
   const existing = new Set(contents.split(/\r?\n/).map(line => line.trim().replace(/\/+$/, '')));
-  const missing = required.filter(entry => !existing.has(entry.slice(0, -1)));
+  const missing = required.filter(entry => !existing.has(entry.replace(/\/+$/, '')));
   if (!missing.length) return false;
   const separator = contents && !contents.endsWith('\n') && !contents.endsWith('\r') ? newline : '';
   await fs.writeFile(file, contents + separator + missing.join(newline) + newline, 'utf8');
@@ -758,9 +788,11 @@ function nextAction(state) {
     brain_reviewing:   'Brain reviewing result',
     blocked_user: state.block_kind === 'consultation_retry'
       ? 'Retry Brain consultation'
-      : ['needs_revision', 'escalation'].includes(state.block_kind)
-        ? 'Awaiting revised guidance'
-        : 'Awaiting user input',
+      : state.block_kind === 'dirty_tree'
+        ? 'Clean the working tree, then resume'
+        : ['needs_revision', 'escalation'].includes(state.block_kind)
+          ? 'Awaiting revised guidance'
+          : 'Awaiting user input',
     paused:    'Paused',
     done:      'Complete ✓',
     cancelled: 'Stopped'
@@ -787,7 +819,7 @@ function controlsFor(state) {
   if (['needs_revision', 'escalation'].includes(state.block_kind)) {
     return ANSI.warn + 'bridge revise "guidance"' + ANSI.reset + ANSI.muted + '  [i] steer  [s] stop  [q] quit' + ANSI.reset;
   }
-  if (state.block_kind === 'consultation_retry') {
+  if (state.block_kind === 'consultation_retry' || state.block_kind === 'dirty_tree') {
     return ANSI.warn + 'bridge resume' + ANSI.reset + ANSI.muted + '  [r] resume  [p] pause  [s] stop  [q] quit' + ANSI.reset;
   }
   const autonomous = ['brain_autonomous', 'brain_approved'].includes(state?.autonomy?.mode);
@@ -1663,6 +1695,22 @@ async function main() {
     return printRunner(await invoke(runner, ['revise', guidance], cwd));
   }
   if (command === 'pause' || command === 'resume' || command === 'stop') {
+    // bridge resume --commit [message]: one-step dirty-tree remedy. Flag value
+    // optional; default message keeps the keystrokes minimal.
+    let resumeCommitMessage;
+    if (command === 'resume') {
+      const flagIndex = args.indexOf('--commit');
+      if (flagIndex >= 0) {
+        const next = args[flagIndex + 1];
+        if (next && !next.startsWith('-')) {
+          resumeCommitMessage = next;
+          args.splice(flagIndex, 2);
+        } else {
+          resumeCommitMessage = 'chore: pre-bridge checkpoint';
+          args.splice(flagIndex, 1);
+        }
+      }
+    }
     if (command === 'stop') {
       const state = await readState(cwd);
       if (state.phase === 'done' || state.phase === 'cancelled') {
@@ -1673,8 +1721,11 @@ async function main() {
       process.stdout.write(
         '\n' + ANSI.primary + '  Resuming session…' + ANSI.reset + '\n'
       );
-      await spawnRunner(['resume'], cwd);
+      await spawnRunner(['resume', ...(resumeCommitMessage !== undefined ? ['--commit', resumeCommitMessage] : [])], cwd);
       return watch(cwd);
+    }
+    if (command === 'resume' && resumeCommitMessage !== undefined) {
+      return printRunner(await invoke(runner, ['resume', '--commit', resumeCommitMessage], cwd));
     }
     return printRunner(await invoke(runner, [command === 'stop' ? 'cancel' : command, ...args], cwd));
   }

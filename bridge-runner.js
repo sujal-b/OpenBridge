@@ -527,6 +527,31 @@ function createActivityPusher(agent, options) {
   };
 }
 
+// Translate raw provider error payloads into one human sentence. Handles the
+// OpenCode event-stream error shape ({"type":"error",...error:{name,data:{message,ref}}}),
+// HTTP status lines, and generic JSON globs. Keeps the provider ref — it is the
+// support anchor — but never dumps machine JSON at the user.
+function humanizeProviderError(rawDetail) {
+  const text = String(rawDetail || '').trim();
+  if (!text) return 'Provider returned an empty error.';
+  // Already human: no JSON braces, no event markers.
+  if (!text.includes('{') && !/\btype\s*:\s*error\b/.test(text)) return text;
+  const gist = [];
+  const nameMatch = text.match(/"name"\s*:\s*"([A-Za-z]+(?:Error|Failure))"/);
+  if (nameMatch) gist.push(nameMatch[1]);
+  const msgMatch = text.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (msgMatch) gist.push(msgMatch[1].replace(/\\"/g, '"'));
+  if (!gist.length) {
+    // Fall back to HTTP-ish lines outside JSON.
+    const plain = text.replace(/\{[^{}]*\}/g, ' ').replace(/\s+/g, ' ').trim();
+    if (plain) gist.push(plain.slice(0, 160));
+  }
+  const refMatch = text.match(/"ref"\s*:\s*"([^"]+)"/);
+  if (refMatch) gist.push('(ref ' + refMatch[1] + ')');
+  if (!gist.length) return text.slice(0, 200);
+  return 'Provider server error: ' + gist.join(' — ') + '. The provider session may be recoverable; retry with bridge resume.';
+}
+
 async function invokeAgentInner(agent, prompt, options = {}) {
   let model = options.model;
   if (!model) {
@@ -581,12 +606,17 @@ async function invokeAgentInner(agent, prompt, options = {}) {
     const detail = rawDetail.length > 1400
       ? rawDetail.slice(0, 280) + ' ... [provider output truncated] ... ' + rawDetail.slice(-900)
       : rawDetail;
+    // Humanize machine error payloads: a raw OpenCode event JSON blob in the
+    // blocked reason is diagnostic poison for the user. Extract the gist,
+    // keep the provider ref for support/debug, drop the noise.
+    const humanDetail = humanizeProviderError(rawDetail);
     const suffix = sessionId ? ' [session ' + sessionId + ']' : '';
     const timing = result.timed_out ? ' after ' + Math.round(timeoutMs / 1000) + 's' : '';
-    const error = new Error(agent + ' failed' + (result.timed_out ? ' (timed out)' : '') + timing + suffix + ': ' + detail);
+    const error = new Error(agent + ' failed' + (result.timed_out ? ' (timed out)' : '') + timing + suffix + ': ' + humanDetail);
     error.code = result.timed_out ? 'provider_timeout' : 'provider_failed';
     error.sessionId = sessionId;
     error.output_truncated = rawDetail.length > detail.length;
+    error.raw_detail = detail;
     throw error;
   }
   try {
@@ -649,11 +679,19 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
     ? (options.proposalFallbackModel || process.env.MIND_LIMB_PROPOSAL_FALLBACK_MODEL || 'opencode/big-pickle')
     : null;
   let lastError;
+  let lastAttemptFailedHard = false;
   const rememberSession = async discovered => {
     if (!discovered || discovered === sessionId) return;
     sessionId = discovered;
     if (typeof options.onSession === 'function') await options.onSession(sessionId);
   };
+  // A provider session that just returned a server-side fault is poisoned
+  // territory: OpenCode continues the broken conversation and fails again.
+  // Retry once with a FRESH session after a hard provider failure (5xx,
+  // UnknownError, crash), and surface that fact in the error if it recurs.
+  const isHardProviderFault = error =>
+    error && (error.code === 'provider_failed' || error.code === 'provider_timeout') &&
+    /\b(5\d\d|UnknownError|server error|Internal Server|Bad Gateway|Service Unavailable)/i.test(String(error.message || ''));
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const retryPrompt = attempt > 1 && lastError
@@ -672,6 +710,9 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
         ...options,
         attempt,
         sessionId,
+        // The poisoned session was dropped above; the next bind must be allowed
+        // to replace the dead session instead of dying on a fork refusal.
+        allowSessionRebind: options.allowSessionRebind || lastAttemptFailedHard,
         ...(useFallbackModel ? { model: fallbackModel } : {})
       });
       await rememberSession(details.sessionId);
@@ -679,11 +720,18 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
       return details;
     } catch (error) {
       lastError = error;
-      await rememberSession(error.sessionId);
+      const hardFault = isHardProviderFault(error);
+      await rememberSession(hardFault ? null : error.sessionId);
+      if (hardFault && sessionId && !lastAttemptFailedHard) {
+        // Drop the poisoned session so the next attempt starts clean.
+        sessionId = null;
+        lastAttemptFailedHard = true;
+      }
       if (attempt >= attempts || !retryableProviderError(error)) {
         if (attempts > 1 && retryableProviderError(error)) {
           error.message += ' (after ' + attempt + ' attempts)';
         }
+        if (hardFault) error.fresh_session_retried = lastAttemptFailedHard;
         if (sessionId) error.sessionId = sessionId;
         throw error;
       }
@@ -1035,6 +1083,223 @@ async function snapshotWorkingTree(cwd) {
   } catch { return null; }
 }
 
+// Same flags as the coordinator's approval-gate snapshot, so preflight and gate
+// can never disagree about what "dirty" means. Uses the real git transport, not
+// options.runProcess: this is an environment precondition probe (the
+// coordinator's gate measures real git too), and provider mocks in tests must
+// not be able to forge or suppress it. Returns null when git itself is
+// unavailable — a missing repository is the approval gate's error to report.
+async function dirtyTreeStatus(options = {}) {
+  const cwd = options.cwd || root;
+  const [status, head] = await Promise.all([
+    runProcess('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
+      cwd,
+      timeoutMs: 30000
+    }).catch(() => null),
+    runProcess('git', ['rev-parse', 'HEAD'], { cwd, timeoutMs: 30000 }).catch(() => null)
+  ]);
+  if (!status || !status.ok) return null;
+  // Same exemption as the coordinator's gate: untracked agent/tool runtime
+  // data never counts as dirt, so a tool cannot block its own session.
+  const split = coordinatorLib.splitTreeLines(
+    status.stdout.split(/\r?\n/).filter(Boolean),
+    coordinatorLib.treeIgnorePaths(cwd)
+  );
+  if (!split.blocking.length) return null;
+  return {
+    files: split.blocking,
+    count: split.blocking.length,
+    // Normalized exactly as the coordinator normalizes scope comparisons, so
+    // the revision carve-out below and the gate's cannot drift apart.
+    paths: split.blocking.flatMap(coordinatorLib.statusPaths).map(coordinatorLib.repoPath).filter(Boolean),
+    head: head && head.ok ? head.stdout.trim() : null
+  };
+}
+
+// Commit the user's current dirt with an explicit message (bridge resume --commit).
+// Excludes runtime-exempt paths and aborts if the user already staged anything —
+// the bridge never sweeps foreign staging into its commits.
+async function commitUserDirt(message, options = {}) {
+  const cwd = options.cwd || root;
+  const git = async args => runProcess('git', args, { cwd, timeoutMs: 60000 }).catch(() => null);
+  const status = await git(['status', '--porcelain=v1', '--untracked-files=all']);
+  if (!status || !status.ok) return { ok: false, error: 'git status failed' };
+  const split = coordinatorLib.splitTreeLines(
+    String(status.stdout || '').split(/\r?\n/).filter(Boolean),
+    coordinatorLib.treeIgnorePaths(cwd)
+  );
+  if (!split.blocking.length) return { ok: true, files: [] };
+  const preStaged = await git(['diff', '--cached', '--name-only', '-z']);
+  if (!preStaged || !preStaged.ok) return { ok: false, error: 'git staging read failed' };
+  if (String(preStaged.stdout || '').split('\0').filter(Boolean).length) {
+    return { ok: false, error: 'you already staged files; commit or unstage them first' };
+  }
+  const paths = [...new Set(split.blocking.flatMap(coordinatorLib.statusPaths))];
+  const add = await git(['add', '-A', '--', ...paths]);
+  if (!add || !add.ok) return { ok: false, error: 'git add failed' };
+  const identity = await git(['config', 'user.name']);
+  const commitArgs = ['commit', '-m', String(message || 'chore: pre-bridge checkpoint')];
+  if (!identity || !identity.ok || !String(identity.stdout || '').trim()) {
+    commitArgs.unshift('-c', 'user.name=mind-limb-bridge', '-c', 'user.email=bridge@mind-limb.local');
+  }
+  const commit = await git(commitArgs);
+  if (!commit || !commit.ok) return { ok: false, error: 'git commit failed' };
+  return { ok: true, files: paths, sha: String(commit.stdout || '').trim().split('\n')[0] };
+}
+
+// Mirror of the approval gate's revision carve-out: while a rejected attempt is
+// being re-worked, the changes that attempt itself produced must not block
+// re-proposal. Any file outside the chunk's accumulated scope, or a HEAD that
+// moved since the chunk baseline (the user committed), still blocks.
+function toleratesRevisionDirt(state, dirty) {
+  const scope = Array.isArray(state?.attempt_scope) ? state.attempt_scope : [];
+  if (!scope.length || !state.git_before || !dirty.head || dirty.head !== state.git_before) return false;
+  const scopeSet = new Set(scope);
+  return dirty.paths.every(p => scopeSet.has(p));
+}
+
+// Auto-commit of an accepted chunk. The bridge owns the tree churn its own
+// execution produced; the human owns everything else. Once the Brain accepts
+// the chunk result, exactly the accepted files are committed so the next chunk
+// starts from a clean tree without a human git round-trip. Only the
+// scope intersection is staged — user edits and stray files stay uncommitted —
+// and pre-existing user staging aborts the commit rather than sweeping it in.
+async function autoCommitChunk(state, options = {}) {
+  // Real git transport, as in dirtyTreeStatus: committing the accepted chunk is
+  // a repository operation, not a provider call, and must not be mockable by
+  // provider stubs.
+  const cwd = options.cwd || root;
+  const git = async args => runProcess('git', args, { cwd, timeoutMs: 60000 }).catch(() => null);
+  const status = await git(['status', '--porcelain=v1', '--untracked-files=all']);
+  if (!status || !status.ok) return { committed: false, skipped: 'git-unavailable' };
+  // Exempt tool runtime data exactly as the tree checks do; it is never staged
+  // into the bridge's commit.
+  const split = coordinatorLib.splitTreeLines(
+    String(status.stdout || '').split(/\r?\n/).filter(Boolean),
+    coordinatorLib.treeIgnorePaths(cwd)
+  );
+  if (!split.blocking.length) return { committed: false, skipped: 'clean' };
+  const scope = Array.isArray(state?.attempt_scope) && state.attempt_scope.length
+    ? state.attempt_scope
+    : (state?.approach?.files || []);
+  const scopeSet = new Set(scope.map(coordinatorLib.repoPath).filter(Boolean));
+  // Paths passed to git must keep their original case — repoPath normalization
+  // (lowercased on win32) is only valid for scope comparison, not pathspecs.
+  const paths = [...new Set(split.blocking.flatMap(coordinatorLib.statusPaths))]
+    .filter(p => scopeSet.has(coordinatorLib.repoPath(p)));
+  if (!paths.length) return { committed: false, skipped: 'out-of-scope' };
+  // Abort before touching the index if the user has staged anything of their
+  // own — the bridge must never sweep foreign staging into its commit.
+  const preStaged = await git(['diff', '--cached', '--name-only', '-z']);
+  if (!preStaged || !preStaged.ok) return { committed: false, skipped: 'staged-read-failed' };
+  const preStagedPaths = preStaged.stdout.split('\0').map(coordinatorLib.repoPath).filter(Boolean);
+  if (!preStagedPaths.every(p => scopeSet.has(p))) return { committed: false, skipped: 'user-staging-present' };
+  const add = await git(['add', '-A', '--', ...paths]);
+  if (!add || !add.ok) return { committed: false, skipped: 'add-failed' };
+  const stagedResult = await git(['diff', '--cached', '--name-only', '-z']);
+  if (!stagedResult || !stagedResult.ok) return { committed: false, skipped: 'staged-read-failed' };
+  const staged = stagedResult.stdout.split('\0').map(coordinatorLib.repoPath).filter(Boolean);
+  if (!staged.length) return { committed: false, skipped: 'nothing-staged' };
+  const task = String(state?.task || '').replace(/\s+/g, ' ').trim().slice(0, 60);
+  const commitArgs = ['commit', '-m', 'bridge(chunk): ' + (task || 'accepted chunk'),
+    '-m', 'Auto-committed by Mind-Limb Bridge after the Brain accepted the chunk result.\nAssignment: ' + (state?.assignment_id || 'unknown')];
+  const identity = await git(['config', 'user.name']);
+  if (!identity || !identity.ok || !String(identity.stdout || '').trim()) {
+    // An unset identity would fail the commit and cost a hands-on-keyboard
+    // round trip; fall back to a bridge identity only when none is configured.
+    commitArgs.unshift('-c', 'user.name=mind-limb-bridge', '-c', 'user.email=bridge@mind-limb.local');
+  }
+  const commit = await git(commitArgs);
+  if (!commit || !commit.ok) return { committed: false, skipped: 'commit-failed' };
+  return { committed: true, files: paths, sha: String(commit.stdout || '').trim().split('\n')[0] };
+}
+
+// Non-fatal wrapper: a failed auto-commit must never fail the review flow —
+// the next chunk's dirty_tree preflight reports whatever is left, with the
+// file list, and the existing block/resume flow handles it from there.
+async function commitAcceptedChunk(state, options = {}) {
+  try {
+    return await autoCommitChunk(state, options);
+  } catch (error) {
+    await runCommand(['activity', 'mind', 'Chunk auto-commit failed: ' + String(error.message).slice(0, 120)], options).catch(() => {});
+    return { committed: false, skipped: 'error', error: error.message };
+  }
+}
+
+// ─── Scaffold auto-commit ─────────────────────────────────────────────────────
+// The bridge's own scaffold files (opencode.json created by bridge open/new)
+// must never block a chunk: they are bridge-created configuration, not user
+// work. Files are recorded with a content hash in .bridge/scaffold.json at
+// creation time; this helper commits only scaffold files that are (a) still
+// untracked, (b) byte-identical to what the bridge wrote, and (c) not staged
+// by the user. Anything else stays in the user's hands.
+async function commitScaffoldFiles(options = {}) {
+  const cwd = options.cwd || root;
+  let manifest;
+  try {
+    manifest = JSON.parse(await fs.readFile(path.join(cwd, '.bridge', 'scaffold.json'), 'utf8'));
+  } catch {
+    return { committed: false, skipped: 'no-manifest' };
+  }
+  const entries = Object.entries(manifest.files || {});
+  if (!entries.length) return { committed: false, skipped: 'no-manifest' };
+  const git = async args => runProcess('git', args, { cwd, timeoutMs: 60000 }).catch(() => null);
+  const status = await git(['status', '--porcelain=v1', '--untracked-files=all']);
+  if (!status || !status.ok) return { committed: false, skipped: 'git-unavailable' };
+  const statusLines = String(status.stdout || '').split(/\r?\n/).filter(Boolean);
+  const untracked = new Map();
+  for (const line of statusLines) {
+    if (!line.startsWith('??')) continue;
+    for (const p of coordinatorLib.statusPaths(line)) untracked.set(coordinatorLib.repoPath(p), p);
+  }
+  const candidates = [];
+  for (const [relPath, meta] of entries) {
+    const key = coordinatorLib.repoPath(relPath);
+    if (!untracked.has(key)) continue; // already tracked, committed, or gone
+    const originalCase = untracked.get(key);
+    let contents;
+    try {
+      contents = await fs.readFile(path.join(cwd, originalCase), 'utf8');
+    } catch {
+      continue;
+    }
+    const sha = crypto.createHash('sha256').update(contents).digest('hex');
+    if (sha !== meta.sha256) continue; // user modified it — no longer bridge-owned
+    candidates.push(originalCase);
+  }
+  if (!candidates.length) return { committed: false, skipped: 'nothing-to-commit' };
+  // Never sweep foreign staging: abort if anything is already staged.
+  const preStaged = await git(['diff', '--cached', '--name-only', '-z']);
+  if (!preStaged || !preStaged.ok) return { committed: false, skipped: 'staged-read-failed' };
+  if (String(preStaged.stdout || '').split('\0').filter(Boolean).length) {
+    return { committed: false, skipped: 'user-staging-present' };
+  }
+  const add = await git(['add', '-A', '--', ...candidates]);
+  if (!add || !add.ok) return { committed: false, skipped: 'add-failed' };
+  const identity = await git(['config', 'user.name']);
+  const commitArgs = ['commit', '-m', 'chore: bridge scaffold files',
+    '-m', 'Auto-committed by Mind-Limb Bridge: bridge-created configuration that must not block chunks.\nFiles: ' + candidates.join(', ')];
+  if (!identity || !identity.ok || !String(identity.stdout || '').trim()) {
+    commitArgs.unshift('-c', 'user.name=mind-limb-bridge', '-c', 'user.email=bridge@mind-limb.local');
+  }
+  const commit = await git(commitArgs);
+  if (!commit || !commit.ok) return { committed: false, skipped: 'commit-failed' };
+  return { committed: true, files: candidates, sha: String(commit.stdout || '').trim().split('\n')[0] };
+}
+
+
+function dirtyTreeReason(dirty) {
+  const listed = dirty.files.slice(0, 10).map(line => '  ' + line);
+  const more = dirty.count > 10 ? '\n  … and ' + (dirty.count - 10) + ' more' : '';
+  const allUntracked = dirty.files.every(line => line.startsWith('??'));
+  const hint = allUntracked
+    ? '\nUntracked agent/tool runtime data is exempt automatically. For other generated paths, add them to .gitignore or to approval.ignorePaths in .bridge/policy.json.'
+    : '';
+  return coordinatorLib.DIRTY_TREE_MESSAGE_PREFIX + ' Commit or stash unrelated changes before starting a chunk.\n'
+    + 'Dirty files (first ' + Math.min(10, dirty.count) + '):\n' + listed.join('\n') + more + hint
+    + '\nQuick fix: bridge resume --commit "checkpoint"  (commits your changes and resumes in one step)';
+}
+
 async function reviewResult(execution, options = {}) {
   const state = await readState(options);
   if (state.phase !== 'brain_reviewing') return { state, result: execution };
@@ -1144,15 +1409,22 @@ async function reviewResult(execution, options = {}) {
       const reason = 'Brain result review reached the automatic chunk limit (' + maxAutoChunks + ').';
       return { state: await blockForUser(reason, options, 'escalation'), error: reason, evaluation };
     }
+    // Commit the accepted chunk before handing the session back to planning:
+    // the commit is idempotent, so a crash between commit and transition just
+    // re-reviews; a crash the other way round would strand the next chunk's
+    // preflight on a dirty tree.
+    const chunkCommit = await commitAcceptedChunk(state, options);
     const feedback = textOf(brainResult, 'Brain requested the next bounded chunk.');
     await coordinatorCommandFallback([['continue', feedback], ['revise', feedback]], options);
     const proposed = await propose({ ...options, autonomous: false });
-    return autoAdvance(proposed, { ...options, _autoRevisionCount: 0, _autoChunkCount: completedChunks });
+    const advanced = await autoAdvance(proposed, { ...options, _autoRevisionCount: 0, _autoChunkCount: completedChunks });
+    return { ...advanced, chunkCommit };
   }
   const summary = textOf(brainResult, 'Brain reviewed the completed chunk.');
+  const chunkCommit = await commitAcceptedChunk(state, options);
   const done = await runCommand(['done', summary], options);
   await runPassiveAfterChecks(done, options);
-  return { state: done, result: brainResult, evaluation };
+  return { state: done, result: brainResult, evaluation, chunkCommit };
 }
 async function autoAdvance(proposed, options = {}) {
   let outcome = proposed;
@@ -1209,6 +1481,14 @@ async function autoAdvance(proposed, options = {}) {
     } catch (error) {
       if (error.code === 'agent_busy') throw error;
       const reason = error.message;
+      // The approval gate's dirty-tree precondition is a retryable environment
+      // block, not a proposal failure: the proposal still stands once the tree
+      // is clean, so blocking as escalation would force a pointless re-proposal.
+      // Matching the stable prefix because error codes do not survive the
+      // subprocess dispatch boundary ('Error: ' is prepended there).
+      if (reason.includes(coordinatorLib.DIRTY_TREE_MESSAGE_PREFIX)) {
+        return { state: await blockForUser(reason, options, 'dirty_tree'), error: reason };
+      }
       return { state: await blockForUser(reason, options, 'escalation'), error: reason };
     }
   }
@@ -1244,6 +1524,12 @@ async function bindSessionIfNeeded(state, sessionId, options = {}) {
   if (!sessionId && state.hands_session_id) return state;
   if (!sessionId) throw new Error('Provider did not return a HANDS session ID; refusing to start a second conversation.');
   if (state.hands_session_id && state.hands_session_id !== sessionId) {
+    // After a hard provider fault the runner drops the poisoned session and
+    // retries fresh; rebinding the replacement session is recovery, not forking.
+    if (options.allowSessionRebind) {
+      await runCommand(['activity', 'mind', 'Provider session replaced after server fault: ' + sessionId.slice(0, 24)], options).catch(() => {});
+      return runCommand(['bind-session', sessionId, '--rebind'], options);
+    }
     throw new Error('Provider returned a different HANDS session ID; refusing to fork the bridge conversation.');
   }
   if (!state.hands_session_id) return runCommand(['bind-session', sessionId], options);
@@ -1273,9 +1559,27 @@ async function propose(options = {}) {
   if (!['planning', 'hands_proposing'].includes(initial.phase)) {
     throw new Error('Proposal requires planning or hands_proposing; found ' + initial.phase + '.');
   }
+  // Fast fail before the proposal agent spends a run: an unclean tree can never
+  // pass the approval gate, so surface the precondition as a dirty_tree block now.
+  // The revision carve-out mirrors the gate: a rejected attempt's own changes
+  // must not force the user to git-clean their own rejected work.
+  // Bridge-owned scaffold files (created by bridge open/new, tracked in
+  // .bridge/scaffold.json) are auto-committed first so a fresh project never
+  // blocks on the bridge's own configuration files.
+  await commitScaffoldFiles(options);
+  const dirty = await dirtyTreeStatus(options);
+  if (dirty && !toleratesRevisionDirt(initial, dirty)) {
+    const reason = dirtyTreeReason(dirty);
+    return { state: await blockForUser(reason, options, 'dirty_tree'), error: reason };
+  }
   try {
+    const rebindAllowed = options.allowSessionRebind === true;
     return await withAgentLock(options, 'hands-propose', async () => {
       const state = await requireCurrentState(initial, options, ['planning', 'hands_proposing']);
+      // An authorized rebind (dead provider session replaced mid-call) changes
+      // hands_session_id; drop it from the identity snapshot so the guards
+      // below don't mistake the recovery for a conversation fork.
+      const identityState = rebindAllowed ? { ...state, hands_session_id: null } : state;
       const policy = await loadTelemetryPolicy(options.cwd || root);
       const context = actionContext(
         state,
@@ -1286,23 +1590,29 @@ async function propose(options = {}) {
       );
       return runTelemetryAction(context, options, async () => {
         await runCommand(['activity', 'hands-propose', 'Reading repository and preparing proposal'], options);
+        // options.sessionId === null means "resume() determined the bound
+        // session died with a provider fault" — skip the stale id so the
+        // provider mints a fresh one instead of continuing the broken
+        // conversation. options.resume() owns that decision because only it
+        // sees the pre-resume block reason.
         const details = await invokeAgentWithRetry('hands-propose', proposalPrompt(state), {
           ...options,
-          sessionId: options.sessionId || state.hands_session_id,
+          sessionId: options.sessionId === undefined ? state.hands_session_id : options.sessionId,
+          allowSessionRebind: rebindAllowed,
           retryAttempts: options.retryAttempts ?? options.proposalRetryAttempts,
           retryDelayMs: options.retryDelayMs ?? options.proposalRetryDelayMs,
           onSession: async sessionId => {
-            const current = await requireCurrentState(state, options, ['planning', 'hands_proposing']);
+            const current = await requireCurrentState(identityState, options, ['planning', 'hands_proposing']);
             await bindSessionIfNeeded(current, sessionId, options);
           },
           onRetry: async ({ nextAttempt, attempts, error }) => {
-            await requireCurrentState(state, options, ['planning', 'hands_proposing']);
+            await requireCurrentState(identityState, options, ['planning', 'hands_proposing']);
             await runCommand(['activity', 'hands-propose', 'Retrying proposal (' + nextAttempt + '/' + attempts + ') after provider failure: ' + String(error.message).slice(0, 160)], options);
             await recordTelemetry({ ...context, status: 'retry', summary: 'hands-proposal retry ' + nextAttempt + '/' + attempts, duration_ms: null }, options);
           },
           actionContext: context
         });
-        const current = await requireCurrentState(state, options, ['planning', 'hands_proposing']);
+        const current = await requireCurrentState(identityState, options, ['planning', 'hands_proposing']);
         const bound = await bindSessionIfNeeded(current, details.sessionId, options);
         const result = details.result;
         if (result.decision === 'blocked') {
@@ -1562,8 +1872,23 @@ async function start(task, options = {}) {
   if (state.phase === 'hands_executing') {
     throw new Error('HANDS is still executing the current task. Wait for the chunk to finish before starting another task.');
   }
-  if (['brain_approving', 'blocked_user', 'paused'].includes(state.phase)) {
-    throw new Error('The current task is ' + state.phase + '. Finish or resume it before starting another task.');
+  // Wide auto-resume: bridge run means "continue", always. A blocked_user
+  // session is resumed (dirty tree, provider failures, revisions pending) —
+  // the block message and its remedy live in the state the user already saw.
+  // Hard refusals remain only for states that need human eyes first:
+  // interrupted execution (bridge recover) and policy escalations (critical
+  // risk). Both print the remedy instead of a dead-end refusal.
+  if (state.phase === 'blocked_user' && !state.recovery_required && !['escalation', 'needs_revision'].includes(state.block_kind)) {
+    return resume(options);
+  }
+  if (state.phase === 'blocked_user' && state.recovery_required) {
+    throw new Error('The last execution was interrupted. Inspect the working tree, then run: bridge recover (followed by bridge run).');
+  }
+  if (state.phase === 'blocked_user' && ['escalation', 'needs_revision'].includes(state.block_kind)) {
+    throw new Error('This session needs your decision (block: ' + (state.block_kind || 'escalation') + '). Run bridge revise "<guidance>" or bridge done to close the task.');
+  }
+  if (['brain_approving', 'paused'].includes(state.phase)) {
+    return options.autonomous === false ? { state } : autoAdvance({ state }, options);
   }
   await runCommand(['start', task], options);
   const proposed = await safePropose(options);
@@ -1580,8 +1905,32 @@ async function safePropose(options) {
     throw error;
   }
 }
+function isProviderFaultReason(reason) {
+  const text = String(reason || '');
+  if (!text) return false;
+  if (/\bProvider server error\b/i.test(text)) return true;
+  if (/\bUnknownError\b/i.test(text)) return true;
+  if (/\bProvider process exceeded the configured timeout\b/i.test(text)) return true;
+  return /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+failed.*?(?:Provider server error|UnknownError|timed out|5\d\d|Bad Gateway|provider process exceeded|provider (?:exploded|crashed|failed))/i.test(text)
+    || /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+failed\s+\(timed out\)/i.test(text)
+    || /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+timed out/i.test(text);
+}
+
 async function resume(options = {}) {
   const current = await readState(options);
+  // A session that died with a hard provider fault must not be replayed:
+  // OpenCode continues the broken conversation and faults again, which is how
+  // a resume turns into the same failure loop. resume() is the only place that
+  // still sees the pre-resume block reason, so it owns the recovery decision:
+  // drop the dead session id and allow the replacement to be bound.
+  const resumeOptions = { ...options };
+  const userActionable = ['needs_revision', 'escalation', 'dirty_tree', 'execution_recovery'].includes(current.block_kind);
+  if (current.phase === 'blocked_user'
+    && !userActionable
+    && (current.block_kind === 'provider_fault' || isProviderFaultReason(current.blocked_reason))) {
+    resumeOptions.sessionId = null;
+    resumeOptions.allowSessionRebind = true;
+  }
   if (current.phase === 'blocked_user' && current.recovery_required) {
     return {
       state: current,
@@ -1592,6 +1941,43 @@ async function resume(options = {}) {
     return {
       state: current,
       error: 'This block requires a revised proposal. Run bridge revise with Brain guidance before resuming.'
+    };
+  }
+  if (current.phase === 'blocked_user' && current.block_kind === 'dirty_tree') {
+    const dirty = await dirtyTreeStatus(options);
+    if (dirty && !toleratesRevisionDirt(current, dirty)) {
+      // One-step remedy: bridge resume --commit [message] commits the user's
+      // dirt (never runtime-exempt or scaffold-owned paths) and re-enters the
+      // flow in the same command. Without the flag the block message stands.
+      if (options.commitMessage !== undefined) {
+        const committed = await commitUserDirt(options.commitMessage, options);
+        if (!committed.ok) {
+          return { state: current, error: dirtyTreeReason(dirty) + '\nCommit failed: ' + committed.error };
+        }
+      } else {
+        return { state: current, error: dirtyTreeReason(dirty) };
+      }
+    }
+    const resumed = await runCommand(['resume'], resumeOptions);
+    if (resumed.phase === 'brain_approving' && ['brain_autonomous', 'brain_approved'].includes(resumed.autonomy?.mode)) {
+      // The Brain's approval attaches to the proposal, which is unchanged — and
+      // the proposal review never read the tree, so re-running it would be a
+      // deterministic re-roll costing a full round trip. The tree is verified
+      // clean above; re-enter the gate directly.
+      await autoApprove(resumed, { ...options, summary: 'Brain approval stands; resumed after working tree cleanup.' });
+      const consulted = await consult({ ...options, autonomous: false });
+      if (consulted.state?.phase !== 'hands_executing') return consulted;
+      return execute({ ...options, autonomous: options.autonomous !== false });
+    }
+    if (['planning', 'hands_proposing'].includes(resumed.phase)) {
+      // Blocked by the preflight before any proposal existed: re-enter propose.
+      const proposed = await safePropose(resumeOptions);
+      return options.autonomous === false ? proposed : autoAdvance(proposed, options);
+    }
+    return {
+      state: resumed,
+      message: 'Resumed — working tree is clean.'
+        + (resumed.phase === 'brain_approving' ? ' Run bridge approve (or press [a]) to continue.' : '')
     };
   }
   if (['planning', 'hands_proposing'].includes(current.phase)) {
@@ -1611,9 +1997,9 @@ async function resume(options = {}) {
   if (!['paused', 'blocked_user'].includes(current.phase)) {
     return { state: current, message: 'No resume needed while the session is ' + current.phase + '.' };
   }
-  const resumed = await runCommand(['resume'], options);
+  const resumed = await runCommand(['resume'], resumeOptions);
   if (['planning', 'hands_proposing'].includes(resumed.phase)) {
-    const proposed = await safePropose(options);
+    const proposed = await safePropose(resumeOptions);
     return options.autonomous === false ? proposed : autoAdvance(proposed, options);
   }
   if (resumed.phase === 'brain_approving') {
@@ -1674,8 +2060,29 @@ async function main() {
   if (command === 'consult') return print(await continueAfterConsult());
   if (command === 'review') return print(await reviewResult());
   if (command === 'unlock-agent') return print(await unlockAgent());
-  if (command === 'resume') return print(await resume());
-  if (command === 'status' || command === 'log' || command === 'done' || command === 'block' || command === 'pause' || command === 'cancel') {
+  if (command === 'resume') {
+    let commitMessage;
+    const flagIndex = args.indexOf('--commit');
+    if (flagIndex >= 0) {
+      const next = args[flagIndex + 1];
+      if (next && !next.startsWith('-')) {
+        commitMessage = next;
+        args.splice(flagIndex, 2);
+      } else {
+        commitMessage = 'chore: pre-bridge checkpoint';
+        args.splice(flagIndex, 1);
+      }
+    }
+    return print(await resume({ commitMessage }));
+  }
+  if (command === 'done') {
+    // Manual chunk acceptance commits the accepted files like the automatic
+    // review does, so both confirmation paths close out with a clean tree.
+    const current = await readState();
+    if (current.phase === 'brain_reviewing') await commitAcceptedChunk(current);
+    return print(await runCommand([command, ...args]));
+  }
+  if (command === 'status' || command === 'log' || command === 'block' || command === 'pause' || command === 'cancel') {
     return print(await runCommand([command, ...args]));
   }
   throw new Error('Unknown command: ' + command);
@@ -1716,7 +2123,7 @@ execute = wrapPhase('execute', execute);
 reviewResult = wrapPhase('reviewResult', reviewResult);
 invokeEvaluator = wrapPhase('invokeEvaluator', invokeEvaluator);
 
-module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError, getTelemetryDropped, drainTelemetry };
+module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError, getTelemetryDropped, drainTelemetry, autoCommitChunk, commitAcceptedChunk, isProviderFaultReason };
 
 // Entry point runs last, after phase instrumentation is installed. main() is
 // async and starts executing immediately, so calling it any earlier would let

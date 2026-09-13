@@ -24,7 +24,7 @@ async function makeTestRepo() {
   return dir;
 }
 
-test('autoAdvance: coordinator transition failure (e.g. dirty git tree) transitions to blocked_user without crashing', async () => {
+test('autoAdvance: approval-gate dirty tree blocks as dirty_tree without crashing', async () => {
   const cwd = await makeTestRepo();
 
   // Create an assignment and submit proposal
@@ -41,16 +41,41 @@ test('autoAdvance: coordinator transition failure (e.g. dirty git tree) transiti
     brainReviewProposal: async () => ({ decision: 'approved', summary: 'Looks good' })
   });
 
-  // Verify that it caught the dirty git tree error and transitioned to blocked_user
+  // A dirty tree is a retryable environment block, not a proposal failure: the
+  // block kind must let resume re-enter approval after cleanup, and the reason
+  // must list the offending files.
   assert.equal(result.state.phase, 'blocked_user');
-  assert.equal(result.state.block_kind, 'escalation');
+  assert.equal(result.state.block_kind, 'dirty_tree');
   assert.match(result.error, /dirty/i);
 
   const finalState = await readState({ cwd });
   assert.equal(finalState.phase, 'blocked_user');
-  assert.equal(finalState.block_kind, 'escalation');
+  assert.equal(finalState.block_kind, 'dirty_tree');
   assert.match(finalState.blocked_reason, /dirty/i);
+  assert.match(finalState.blocked_reason, /unrelated\.txt/);
+  assert.equal(finalState.resume_phase, 'brain_approving');
 
   // Clean up
+  await fs.rm(cwd, { recursive: true, force: true }).catch(() => {});
+});
+
+test('autoAdvance: non-environmental transition failures still block as escalation', async () => {
+  const cwd = await makeTestRepo();
+
+  spawnSync(process.execPath, [coordinator, 'start', 'Add feature'], { cwd });
+  // No --files: the approval gate rejects the approach for a reason no amount
+  // of tree cleanup can fix, so escalation (revise) is the correct outcome.
+  spawnSync(process.execPath, [coordinator, 'approach', 'Update README'], { cwd });
+
+  const proposedState = await readState({ cwd });
+  const result = await autoAdvance({ state: proposedState }, {
+    cwd,
+    brainReviewProposal: async () => ({ decision: 'approved', summary: 'Looks good' })
+  });
+
+  assert.equal(result.state.phase, 'blocked_user');
+  assert.equal(result.state.block_kind, 'escalation');
+  assert.match(result.error, /at least one file/i);
+
   await fs.rm(cwd, { recursive: true, force: true }).catch(() => {});
 });
