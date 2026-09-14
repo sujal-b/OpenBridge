@@ -284,7 +284,7 @@ function extractBrainText(stdout) {
 
 async function callBrainViaOpencode(prompt, options, resolved) {
   var cwd = (options && options.cwd) || process.cwd();
-  var timeoutMs = resolved.timeoutMs || 60000;
+  var timeoutMs = resolved.timeoutMs || 120000;
   var model = resolved.model || 'opencode/muse-spark-1.3-contributor-free';
   var command = process.env.MIND_LIMB_OPENCODE_COMMAND || 'opencode';
   var runProcessFn = (options && options.runProcess) || runProcess;
