@@ -1037,38 +1037,78 @@ async function releaseAgentLock(lock) {
   });
 }
 
-async function recover() {
+async function recover(args = []) {
+  const flagList = Array.isArray(args) ? args : (typeof args === 'string' ? args.trim().split(/\s+/) : []);
+  const forReview = flagList.includes('--review');
   const lock = await claimAgentLock('recovery');
   try {
-    return await mutate('execution_recovered', 'Execution recovery acknowledged; waiting for user resume', next => {
-      if (next.phase === 'blocked_user' && next.recovery_required) {
-        next.recovery_required = false;
+    const git = forReview ? await gitSnapshot() : null;
+    return await mutate(
+      'execution_recovered',
+      forReview ? 'Execution recovered for Brain review' : 'Execution recovery acknowledged; waiting for user resume',
+      next => {
+        const isBlockedRecovery = next.phase === 'blocked_user' && next.recovery_required;
+        const isExecuting = next.phase === 'hands_executing';
+        if (!isBlockedRecovery && !isExecuting) {
+          throw new Error('Recovery is only valid while HANDS is executing or waiting for execution recovery; found ' + next.phase + '.');
+        }
+        if (forReview) {
+          if (!git.isRepo) throw new Error('Execution verification requires a Git repository.');
+          const changed = [...new Set(git.status.flatMap(statusPaths))];
+          if (!git.dirty || !changed.length) {
+            throw new Error('Recovery with --review requires changes present in the working tree.');
+          }
+          const headChanged = git.head !== next.git_before;
+          const scope = Array.isArray(next.attempt_scope) && next.attempt_scope.length
+            ? next.attempt_scope
+            : (next.approach?.files || []);
+          const approved = new Set(scope.map(repoPath).filter(Boolean));
+          const outOfScope = changed.filter(file => !approved.has(repoPath(file)));
+
+          if (headChanged || outOfScope.length) {
+            const reason = headChanged ? 'the Git HEAD changed during execution' : 'files outside the approved scope: ' + outOfScope.join(', ');
+            throw new Error('Scope violation: ' + reason);
+          }
+
+          assertTransition(next.phase, 'brain_reviewing');
+          next.phase = 'brain_reviewing';
+          next.active_agent = 'mind';
+          next.activity = { agent: 'mind', action: 'Reviewing recovered chunk execution', started_at: now() };
+          next.git_after = git.head;
+          next.git_status = 'changes_present';
+          next.recovery_required = false;
+          next.execution_claimed = false;
+          next.blocked_reason = null;
+          next.block_kind = null;
+          next.resume_phase = null;
+          return;
+        }
+        if (isBlockedRecovery) {
+          next.recovery_required = false;
+          next.active_agent = 'user';
+          next.block_kind = null;
+          next.activity = { agent: 'user', action: 'Recovery acknowledged; inspect complete', started_at: now() };
+          next.blocked_reason = 'Recovery acknowledged. Run bridge resume only after confirming the working tree is safe.';
+          next.resume_phase = 'hands_consulting';
+          next.execution_lease_id = null;
+          next.revision_consumed = false;
+          next.execution_claimed = false;
+          next.execution_started_at = null;
+          return;
+        }
+        next.phase = 'blocked_user';
         next.active_agent = 'user';
-        next.block_kind = null;
         next.activity = { agent: 'user', action: 'Recovery acknowledged; inspect complete', started_at: now() };
-        next.blocked_reason = 'Recovery acknowledged. Run bridge resume only after confirming the working tree is safe.';
+        next.blocked_reason = 'Execution was interrupted. Inspect the working tree, then run bridge resume.';
+        next.recovery_required = false;
         next.resume_phase = 'hands_consulting';
         next.execution_lease_id = null;
+        next.block_kind = null;
         next.revision_consumed = false;
         next.execution_claimed = false;
         next.execution_started_at = null;
-        return;
       }
-      if (next.phase !== 'hands_executing') {
-        throw new Error('Recovery is only valid while HANDS is executing or waiting for execution recovery; found ' + next.phase + '.');
-      }
-      next.phase = 'blocked_user';
-      next.active_agent = 'user';
-      next.activity = { agent: 'user', action: 'Recovery acknowledged; inspect complete', started_at: now() };
-      next.blocked_reason = 'Execution was interrupted. Inspect the working tree, then run bridge resume.';
-      next.recovery_required = false;
-      next.resume_phase = 'hands_consulting';
-      next.execution_lease_id = null;
-      next.block_kind = null;
-      next.revision_consumed = false;
-      next.execution_claimed = false;
-      next.execution_started_at = null;
-    });
+    );
   } finally {
     await releaseAgentLock(lock);
   }
@@ -1199,7 +1239,7 @@ function help() {
     '  revise [summary]             Request a revised approach',
     '  complete [lease-id] <summary> Report HANDS chunk complete',
     '  block <reason>               Stop and wait for the user',
-    '  recover                      Recover an interrupted HANDS execution',
+    '  recover [--review]           Recover an interrupted HANDS execution',
     '  resume                       Resume a blocked or paused session',
     '  pause                        Pause the session',
     '  done [summary]               Mark the reviewed session complete',
@@ -1249,7 +1289,7 @@ async function dispatchCommand(command, args) {
       }
       return { state: await block(args.join(' '), kind) };
     }
-    case 'recover': return { state: await recover() };
+    case 'recover': return { state: await recover(args) };
     case 'resume': return { state: await resume() };
     case 'pause': return { state: await pause() };
     case 'done': return { state: await finish(args.join(' ')) };
@@ -1286,7 +1326,7 @@ async function handleCommand(args, options = {}) {
   return outcome;
 }
 
-module.exports = { handleCommand, DIRTY_TREE_MESSAGE_PREFIX, statusPaths, repoPath, treeIgnorePaths, splitTreeLines, DEFAULT_RUNTIME_DIRS };
+module.exports = { handleCommand, DIRTY_TREE_MESSAGE_PREFIX, statusPaths, repoPath, treeIgnorePaths, splitTreeLines, DEFAULT_RUNTIME_DIRS, recover };
 
 if (require.main === module) {
   process.on('uncaughtException', (err) => {

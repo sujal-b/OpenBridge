@@ -394,4 +394,129 @@ test('isProviderFaultReason distinguishes real provider crashes from tasks/guida
   assert.equal(runner.isProviderFaultReason('brain failed: 502 Bad Gateway'), true);
   assert.equal(runner.isProviderFaultReason('Provider server error: Connection reset by peer.'), true);
   assert.equal(runner.isProviderFaultReason('UnknownError: OpenCode runtime terminated unexpectedly'), true);
+  assert.equal(runner.isProviderFaultReason('hands-propose failed: connection reset by peer'), true);
+  assert.equal(runner.isProviderFaultReason('connect ECONNREFUSED 127.0.0.1:20128'), true);
+  assert.equal(runner.isProviderFaultReason('hands-propose failed: API connection crash'), true);
+  assert.equal(runner.isSessionForkReason('Provider returned a different HANDS session ID; refusing to fork the bridge conversation.'), true);
+  assert.equal(runner.isSessionForkReason('Fix provider authentication'), false);
 });
+
+// ─── [MF-02] Session Rebind on Provider Restart ───────────────────────────────
+
+test('MF-02 regression: automated retry after API connection crash rebinds replacement session without fork violation', async () => {
+  const { cwd } = await gitWorkspace('friction-conn-crash-retry-');
+  try {
+    await coordinator.handleCommand(['init'], { cwd });
+    await coordinator.handleCommand(['start', 'Connection crash retry task'], { cwd });
+    await coordinator.handleCommand(['bind-session', 'ses_initial'], { cwd });
+    let state = await runner.readState({ cwd });
+    assert.equal(state.hands_session_id, 'ses_initial');
+
+    let proposeCalls = 0;
+    const runProcess = mockProvider((agent, args) => {
+      if (agent === 'hands-propose') {
+        proposeCalls += 1;
+        if (proposeCalls === 1) {
+          return { ok: false, code: 1, signal: null, stdout: '', stderr: 'connect ECONNREFUSED 127.0.0.1:20128', timed_out: false };
+        }
+        return ok({ ...proposeOk('ses_restarted_fresh'), sessionID: 'ses_restarted_fresh' });
+      }
+      return ok({});
+    });
+
+    const result = await runner.propose({ cwd, runProcess, retryDelayMs: 0, autonomous: false });
+    assert.ok(!result.error, 'propose must succeed after connection crash retry: ' + result.error);
+    assert.equal(proposeCalls, 2, 'expected exactly 1 retry');
+    state = await runner.readState({ cwd });
+    assert.equal(state.hands_session_id, 'ses_restarted_fresh', 'replacement session must be rebound');
+    assert.notEqual(state.phase, 'blocked_user', 'must not halt into blocked_user');
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('MF-02 regression: runner resume after connection crash rebinds replacement session without fork violation', async () => {
+  const { cwd } = await gitWorkspace('friction-conn-crash-resume-');
+  try {
+    await coordinator.handleCommand(['init'], { cwd });
+    await coordinator.handleCommand(['start', 'Connection crash resume task'], { cwd });
+    const stateFile = path.join(cwd, '.bridge', 'state.json');
+    const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    state.phase = 'blocked_user';
+    state.block_kind = null;
+    state.hands_session_id = 'ses_dead_conn';
+    state.blocked_reason = 'hands-propose failed [session ses_dead_conn]: connection reset by peer';
+    await fs.writeFile(stateFile, JSON.stringify(state));
+
+    const runProcess = mockProvider(agent => {
+      if (agent === 'hands-propose') {
+        return ok({ ...proposeOk('ses_reborn_conn'), sessionID: 'ses_reborn_conn' });
+      }
+      return ok({});
+    });
+
+    const result = await runner.resume({ cwd, autonomous: false, runProcess });
+    assert.ok(!result.error, 'resume must succeed: ' + result.error);
+    const after = await runner.readState({ cwd });
+    assert.equal(after.hands_session_id, 'ses_reborn_conn');
+    assert.notEqual(after.phase, 'blocked_user', 'must leave blocked_user state');
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('MF-02 regression: runner resume after false-positive fork refusal unblocks and permits rebind', async () => {
+  const { cwd } = await gitWorkspace('friction-fork-untrap-');
+  try {
+    await coordinator.handleCommand(['init'], { cwd });
+    await coordinator.handleCommand(['start', 'Fork untrap task'], { cwd });
+    const stateFile = path.join(cwd, '.bridge', 'state.json');
+    const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
+    state.phase = 'blocked_user';
+    state.block_kind = null;
+    state.hands_session_id = 'ses_trapped_old';
+    state.blocked_reason = 'Provider returned a different HANDS session ID; refusing to fork the bridge conversation.';
+    await fs.writeFile(stateFile, JSON.stringify(state));
+
+    const runProcess = mockProvider(agent => {
+      if (agent === 'hands-propose') {
+        return ok({ ...proposeOk('ses_untrapped_new'), sessionID: 'ses_untrapped_new' });
+      }
+      return ok({});
+    });
+
+    const result = await runner.resume({ cwd, autonomous: false, runProcess });
+    assert.ok(!result.error, 'resume must untrap from false-positive fork: ' + result.error);
+    const after = await runner.readState({ cwd });
+    assert.equal(after.hands_session_id, 'ses_untrapped_new');
+    assert.notEqual(after.phase, 'blocked_user');
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test('MF-02 regression: arbitrary unprovoked session switch without documented fault still throws fork violation', async () => {
+  const { cwd } = await gitWorkspace('friction-fork-refusal-');
+  try {
+    await coordinator.handleCommand(['init'], { cwd });
+    await coordinator.handleCommand(['start', 'Strict fork test'], { cwd });
+    await coordinator.handleCommand(['bind-session', 'ses_original'], { cwd });
+
+    // Provider unilaterally returns a new session ID with NO prior fault / retry
+    const runProcess = mockProvider(agent => {
+      if (agent === 'hands-propose') {
+        return ok({ ...proposeOk('ses_rogue_fork'), sessionID: 'ses_rogue_fork' });
+      }
+      return ok({});
+    });
+
+    const result = await runner.propose({ cwd, runProcess, retryAttempts: 1, retryDelayMs: 0, autonomous: false });
+    assert.match(String(result.error || ''), /refusing to fork the bridge conversation/);
+    const after = await runner.readState({ cwd });
+    assert.equal(after.phase, 'blocked_user');
+    assert.equal(after.hands_session_id, 'ses_original', 'original session must not be overwritten by unprovoked fork');
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true });
+  }
+});
+

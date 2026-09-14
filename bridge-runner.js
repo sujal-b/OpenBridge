@@ -4,7 +4,7 @@
 const fs = require('node:fs/promises');
 const crypto = require('node:crypto');
 const path = require('node:path');
-const { runProcess, parseStructuredResult, extractSessionId, buildOpencodeArgs } = require('./bridge-adapter');
+const { runProcess, parseStructuredResult, extractSessionId, buildOpencodeArgs, terminateProcessTree, terminateAllActiveProcesses } = require('./bridge-adapter');
 const { getActiveHandsModel, getActiveBrainProviderSync, detectGenerationSync } = require('./bridge-config');
 const { appendAction } = require('./bridge-actions');
 const { loadPolicy, classifyAction, resolvePolicyMode, policyGate } = require('./bridge-policy');
@@ -471,6 +471,11 @@ async function withAgentLock(options, agent, action) {
   const lock = await acquireAgentLock(options, agent);
   try {
     return await action();
+  } catch (error) {
+    if (error.code === 'stale_state') {
+      await terminateAllActiveProcesses();
+    }
+    throw error;
   } finally {
     await releaseAgentLock(lock);
   }
@@ -590,13 +595,55 @@ async function invokeAgentInner(agent, prompt, options = {}) {
   };
   if (options.onLine) processOptions.onLine = options.onLine;
   if (options.onEvent || providerEvents) processOptions.onEvent = combineCallbacks(options.onEvent, providerEvents);
+
+  const abortController = new AbortController();
+  if (options.signal) {
+    if (options.signal.aborted) abortController.abort(options.signal.reason);
+    else options.signal.addEventListener('abort', () => abortController.abort(options.signal.reason), { once: true });
+  }
+  processOptions.signal = abortController.signal;
+
+  let stateTimer = null;
+  let statePreempted = null;
+  const stateCheckMs = Math.max(100, Number(process.env.MIND_LIMB_STATE_CHECK_MS) || 1000);
+  if (options.monitorState !== false) {
+    stateTimer = setInterval(async () => {
+      try {
+        const cur = await readState(options);
+        if (cur && (cur.phase === 'paused' || cur.phase === 'cancelled')) {
+          if (stateTimer) {
+            clearInterval(stateTimer);
+            stateTimer = null;
+          }
+          statePreempted = cur;
+          abortController.abort(new Error('Session preempted: ' + cur.phase));
+        }
+      } catch {}
+    }, stateCheckMs);
+    if (typeof stateTimer.unref === 'function') stateTimer.unref();
+  }
+
   let result;
   try {
     result = await processRunner(options.command || opencodeCommand, args, processOptions);
+  } catch (err) {
+    if (statePreempted) {
+      const exp = options.expectedState || { phase: agent, assignment_id: statePreempted.assignment_id };
+      throw staleStateError(exp, statePreempted);
+    }
+    throw err;
   } finally {
+    if (stateTimer) {
+      clearInterval(stateTimer);
+      stateTimer = null;
+    }
     // Flush even when the provider call throws, so the last observed activity
     // (often the failure itself) still reaches the dashboard.
     if (activityPusher) await activityPusher.flush();
+  }
+  if (statePreempted) {
+    const exp = options.expectedState || { phase: agent, assignment_id: statePreempted.assignment_id };
+    throw staleStateError(exp, statePreempted);
   }
   const sessionId = extractSessionId(result.stdout);
   if (!result.ok) {
@@ -652,9 +699,9 @@ async function invokeAgent(agent, prompt, options = {}) {
 }
 
 function retryableProviderError(error) {
-  if (!error || ['agent_busy', 'stale_state', 'invalid_transition'].includes(error.code)) return false;
+  if (!error || ['agent_busy', 'stale_state', 'invalid_transition', 'ABORT_ERR'].includes(error.code) || error.name === 'AbortError') return false;
   const message = String(error.message || '').toLowerCase();
-  if (/different hands session|no hands session|permission denied|user decision/.test(message)) return false;
+  if (/different hands session|no hands session|permission denied|user decision|abort/.test(message)) return false;
   return ['provider_timeout', 'provider_failed', 'invalid_provider_result', 'transient_consultation_failure', 'brain_review_missing'].includes(error.code)
     || /timed out|returned no valid structured|temporarily unavailable|connection reset|econnreset|econnrefused/.test(message);
 }
@@ -680,10 +727,10 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
     : null;
   let lastError;
   let lastAttemptFailedHard = false;
-  const rememberSession = async discovered => {
+  const rememberSession = async (discovered, sessionOpts = {}) => {
     if (!discovered || discovered === sessionId) return;
     sessionId = discovered;
-    if (typeof options.onSession === 'function') await options.onSession(sessionId);
+    if (typeof options.onSession === 'function') await options.onSession(sessionId, sessionOpts);
   };
   // A provider session that just returned a server-side fault is poisoned
   // territory: OpenCode continues the broken conversation and fails again.
@@ -691,12 +738,12 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
   // UnknownError, crash), and surface that fact in the error if it recurs.
   const isHardProviderFault = error =>
     error && (error.code === 'provider_failed' || error.code === 'provider_timeout') &&
-    /\b(5\d\d|UnknownError|server error|Internal Server|Bad Gateway|Service Unavailable)/i.test(String(error.message || ''));
+    /\b(5\d\d|UnknownError|server error|Internal Server|Bad Gateway|Service Unavailable|connection\s*(?:reset|refused|error|crash|closed)|econn\w*|socket hang up|provider (?:crashed|exploded|failed|failure)|terminated unexpectedly)/i.test(String(error.message || ''));
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const retryPrompt = attempt > 1 && lastError
         ? lastError.code === 'invalid_provider_result'
-          ? prompt + '\nYour previous response was unusable. Return the required JSON object only.'
+        ? prompt + '\nYour previous response was unusable. Return the required JSON object only.'
           : lastError.code === 'brain_review_missing'
             ? prompt + '\nYour previous review omitted observable ask_codex evidence. Retry the protocol: call ask_codex exactly once, then return the required JSON object only. Do not approve without an ask_codex event.'
             : prompt
@@ -706,18 +753,22 @@ async function invokeAgentWithRetry(agent, prompt, options = {}) {
         && lastError?.code === 'invalid_provider_result'
         && fallbackModel
         && options.model !== fallbackModel;
+      const retryRebindAllowed = Boolean(options.allowSessionRebind || lastAttemptFailedHard || (attempt > 1 && lastError));
       const details = await invokeAgent(agent, retryPrompt, {
         ...options,
         attempt,
         sessionId,
         // The poisoned session was dropped above; the next bind must be allowed
         // to replace the dead session instead of dying on a fork refusal.
-        allowSessionRebind: options.allowSessionRebind || lastAttemptFailedHard,
+        allowSessionRebind: retryRebindAllowed,
         ...(useFallbackModel ? { model: fallbackModel } : {})
       });
-      await rememberSession(details.sessionId);
+      await rememberSession(details.sessionId, { allowSessionRebind: retryRebindAllowed });
       if (typeof options.validateResult === 'function') await options.validateResult(details.result);
-      return details;
+      return {
+        ...details,
+        allowSessionRebind: retryRebindAllowed
+      };
     } catch (error) {
       lastError = error;
       const hardFault = isHardProviderFault(error);
@@ -1520,13 +1571,46 @@ async function blockForUser(reason, options = {}, blockKind) {
     throw error;
   }
 }
+function isSessionForkReason(reason) {
+  const text = String(reason || '');
+  if (!text) return false;
+  return /\b(?:different HANDS session ID|refusing to fork the bridge conversation)\b/i.test(text);
+}
+
+async function hasDocumentedProviderFault(state, options = {}) {
+  if (!state || typeof state !== 'object') return false;
+  if (state.block_kind === 'provider_fault') return true;
+  if (isProviderFaultReason(state.blocked_reason) || isSessionForkReason(state.blocked_reason)) return true;
+  if (isProviderFaultReason(state.activity?.action)) return true;
+  const cwd = options.cwd || root;
+  try {
+    const tail = await readJsonlTail(bridgePath(cwd, 'events.jsonl'), {
+      source: 'events.jsonl',
+      maxBytes: 32 * 1024,
+      limit: 10
+    });
+    for (let i = tail.values.length - 1; i >= 0; i--) {
+      const ev = tail.values[i];
+      if (['execution_claimed', 'completed'].includes(ev.type)) break;
+      if (ev.type === 'blocked_user' && (ev.block_kind === 'provider_fault' || isProviderFaultReason(ev.reason || ev.blocked_reason) || isSessionForkReason(ev.reason || ev.blocked_reason))) {
+        return true;
+      }
+      if (isProviderFaultReason(ev.summary) || isSessionForkReason(ev.summary)) {
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
 async function bindSessionIfNeeded(state, sessionId, options = {}) {
   if (!sessionId && state.hands_session_id) return state;
   if (!sessionId) throw new Error('Provider did not return a HANDS session ID; refusing to start a second conversation.');
   if (state.hands_session_id && state.hands_session_id !== sessionId) {
     // After a hard provider fault the runner drops the poisoned session and
     // retries fresh; rebinding the replacement session is recovery, not forking.
-    if (options.allowSessionRebind) {
+    const rebindAllowed = Boolean(options.allowSessionRebind || (await hasDocumentedProviderFault(state, options)));
+    if (rebindAllowed) {
       await runCommand(['activity', 'mind', 'Provider session replaced after server fault: ' + sessionId.slice(0, 24)], options).catch(() => {});
       return runCommand(['bind-session', sessionId, '--rebind'], options);
     }
@@ -1537,9 +1621,14 @@ async function bindSessionIfNeeded(state, sessionId, options = {}) {
 }
 
 function staleStateError(expected, current) {
-  const error = new Error('Bridge state changed while the agent was starting: expected ' + expected.phase + '/' + expected.assignment_id + ', found ' + current.phase + '/' + current.assignment_id + '.');
+  const expPhase = expected?.phase || 'active';
+  const expId = expected?.assignment_id || 'current';
+  const curPhase = current?.phase || 'unknown';
+  const curId = current?.assignment_id || 'unknown';
+  const error = new Error('Bridge state changed while the agent was starting: expected ' + expPhase + '/' + expId + ', found ' + curPhase + '/' + curId + '.');
   error.code = 'stale_state';
   error.state = current;
+  terminateAllActiveProcesses().catch(() => {});
   return error;
 }
 
@@ -1550,7 +1639,10 @@ async function requireCurrentState(expected, options, phases) {
     && current.revision === expected.revision
     && (!expected.hands_session_id || current.hands_session_id === expected.hands_session_id)
     && (!expected.execution_lease_id || current.execution_lease_id === expected.execution_lease_id);
-  if (!sameIdentity || !phases.includes(current.phase)) throw staleStateError(expected, current);
+  if (!sameIdentity || !phases.includes(current.phase)) {
+    await terminateAllActiveProcesses();
+    throw staleStateError(expected, current);
+  }
   return current;
 }
 
@@ -1573,13 +1665,14 @@ async function propose(options = {}) {
     return { state: await blockForUser(reason, options, 'dirty_tree'), error: reason };
   }
   try {
-    const rebindAllowed = options.allowSessionRebind === true;
+    const rebindAllowed = options.allowSessionRebind === true
+      || (await hasDocumentedProviderFault(initial, options));
     return await withAgentLock(options, 'hands-propose', async () => {
       const state = await requireCurrentState(initial, options, ['planning', 'hands_proposing']);
       // An authorized rebind (dead provider session replaced mid-call) changes
       // hands_session_id; drop it from the identity snapshot so the guards
       // below don't mistake the recovery for a conversation fork.
-      const identityState = rebindAllowed ? { ...state, hands_session_id: null } : state;
+      let currentIdentityState = rebindAllowed ? { ...state, hands_session_id: null } : state;
       const policy = await loadTelemetryPolicy(options.cwd || root);
       const context = actionContext(
         state,
@@ -1597,23 +1690,28 @@ async function propose(options = {}) {
         // sees the pre-resume block reason.
         const details = await invokeAgentWithRetry('hands-propose', proposalPrompt(state), {
           ...options,
-          sessionId: options.sessionId === undefined ? state.hands_session_id : options.sessionId,
+          expectedState: state,
+          sessionId: options.sessionId === undefined ? (rebindAllowed ? null : state.hands_session_id) : options.sessionId,
           allowSessionRebind: rebindAllowed,
           retryAttempts: options.retryAttempts ?? options.proposalRetryAttempts,
           retryDelayMs: options.retryDelayMs ?? options.proposalRetryDelayMs,
-          onSession: async sessionId => {
-            const current = await requireCurrentState(identityState, options, ['planning', 'hands_proposing']);
-            await bindSessionIfNeeded(current, sessionId, options);
+          onSession: async (sessionId, sessionOpts = {}) => {
+            const rebind = rebindAllowed || Boolean(sessionOpts.allowSessionRebind);
+            if (rebind) currentIdentityState = { ...currentIdentityState, hands_session_id: null };
+            const current = await requireCurrentState(currentIdentityState, options, ['planning', 'hands_proposing']);
+            await bindSessionIfNeeded(current, sessionId, { ...options, allowSessionRebind: rebind });
           },
           onRetry: async ({ nextAttempt, attempts, error }) => {
-            await requireCurrentState(identityState, options, ['planning', 'hands_proposing']);
+            await requireCurrentState(currentIdentityState, options, ['planning', 'hands_proposing']);
             await runCommand(['activity', 'hands-propose', 'Retrying proposal (' + nextAttempt + '/' + attempts + ') after provider failure: ' + String(error.message).slice(0, 160)], options);
             await recordTelemetry({ ...context, status: 'retry', summary: 'hands-proposal retry ' + nextAttempt + '/' + attempts, duration_ms: null }, options);
           },
           actionContext: context
         });
-        const current = await requireCurrentState(identityState, options, ['planning', 'hands_proposing']);
-        const bound = await bindSessionIfNeeded(current, details.sessionId, options);
+        const rebind = rebindAllowed || Boolean(details.allowSessionRebind);
+        if (rebind) currentIdentityState = { ...currentIdentityState, hands_session_id: null };
+        const current = await requireCurrentState(currentIdentityState, options, ['planning', 'hands_proposing']);
+        const bound = await bindSessionIfNeeded(current, details.sessionId, { ...options, allowSessionRebind: rebind });
         const result = details.result;
         if (result.decision === 'blocked') {
           const reason = textOf(result, 'HANDS needs a user decision.') + (result.context ? ' Context: ' + result.context : '');
@@ -1634,7 +1732,10 @@ async function propose(options = {}) {
     });
   } catch (error) {
     if (error.code === 'agent_busy') throw error;
-    if (error.code === 'stale_state') return { state: error.state || await readState(options), error: error.message };
+    if (error.code === 'stale_state') {
+      await terminateAllActiveProcesses();
+      return { state: error.state || await readState(options), error: error.message };
+    }
     return { state: await blockForUser(error.message, options), error: error.message };
   }
 }
@@ -1707,6 +1808,7 @@ async function consult(options = {}) {
         }
         const details = await invokeAgentWithRetry('hands-consult', consultationPrompt(state, brainGuidance), {
           ...options,
+          expectedState: state,
           timeoutMs: options.timeoutMs ?? defaultConsultTimeoutMs,
           sessionId: options.sessionId || state.hands_session_id,
           onEvent: brainGuidance
@@ -1751,7 +1853,10 @@ async function consult(options = {}) {
     });
   } catch (error) {
     if (error.code === 'agent_busy') throw error;
-    if (error.code === 'stale_state') return { state: error.state || await readState(options), error: error.message };
+    if (error.code === 'stale_state') {
+      await terminateAllActiveProcesses();
+      return { state: error.state || await readState(options), error: error.message };
+    }
     return { state: await blockForUser(error.message, options, ['transient_consultation_failure', 'provider_timeout', 'provider_failed', 'invalid_provider_result', 'brain_consultation_missing'].includes(error.code) ? 'consultation_retry' : undefined), error: error.message };
   }
 }
@@ -1804,6 +1909,7 @@ async function execute(options = {}) {
         await runCommand(['activity', 'hands', 'Executing the consulted chunk'], options);
         const details = await invokeAgent('hands', executionPrompt(claimed), {
           ...options,
+          expectedState: claimed,
           sessionId: options.sessionId || claimed.hands_session_id,
           actionContext: context
         });
@@ -1825,7 +1931,10 @@ async function execute(options = {}) {
     return executed;
   } catch (error) {
     if (error.code === 'agent_busy') throw error;
-    if (error.code === 'stale_state') return { state: error.state || await readState(options), error: error.message };
+    if (error.code === 'stale_state') {
+      await terminateAllActiveProcesses();
+      return { state: error.state || await readState(options), error: error.message };
+    }
     const reason = error.code === 'provider_timeout'
       ? error.message + ' HANDS may have partially changed files. Inspect the working tree, then run bridge recover before resuming.'
       : error.message;
@@ -1911,9 +2020,11 @@ function isProviderFaultReason(reason) {
   if (/\bProvider server error\b/i.test(text)) return true;
   if (/\bUnknownError\b/i.test(text)) return true;
   if (/\bProvider process exceeded the configured timeout\b/i.test(text)) return true;
-  return /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+failed.*?(?:Provider server error|UnknownError|timed out|5\d\d|Bad Gateway|provider process exceeded|provider (?:exploded|crashed|failed))/i.test(text)
+  if (/\b(?:connection reset by peer|connect ECONNREFUSED|connect ECONNRESET)\b/i.test(text)) return true;
+  return /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+failed.*?(?:Provider server error|UnknownError|timed out|5\d\d|Bad Gateway|provider process exceeded|provider (?:exploded|crashed|failed|failure)|connection\s*(?:reset|refused|error|crash|closed)|econn\w*|socket hang up|terminated unexpectedly)/i.test(text)
     || /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+failed\s+\(timed out\)/i.test(text)
-    || /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+timed out/i.test(text);
+    || /(?:hands(?:-(?:propose|consult|evaluate))?|brain)\s+timed out/i.test(text)
+    || /\b(?:Retrying proposal|Retrying Brain consultation).*?after provider (?:failure|fault)/i.test(text);
 }
 
 async function resume(options = {}) {
@@ -1927,7 +2038,7 @@ async function resume(options = {}) {
   const userActionable = ['needs_revision', 'escalation', 'dirty_tree', 'execution_recovery'].includes(current.block_kind);
   if (current.phase === 'blocked_user'
     && !userActionable
-    && (current.block_kind === 'provider_fault' || isProviderFaultReason(current.blocked_reason))) {
+    && (current.block_kind === 'provider_fault' || isProviderFaultReason(current.blocked_reason) || isSessionForkReason(current.blocked_reason))) {
     resumeOptions.sessionId = null;
     resumeOptions.allowSessionRebind = true;
   }
@@ -1972,7 +2083,7 @@ async function resume(options = {}) {
     if (['planning', 'hands_proposing'].includes(resumed.phase)) {
       // Blocked by the preflight before any proposal existed: re-enter propose.
       const proposed = await safePropose(resumeOptions);
-      return options.autonomous === false ? proposed : autoAdvance(proposed, options);
+      return options.autonomous === false ? proposed : autoAdvance(proposed, resumeOptions);
     }
     return {
       state: resumed,
@@ -1981,8 +2092,8 @@ async function resume(options = {}) {
     };
   }
   if (['planning', 'hands_proposing'].includes(current.phase)) {
-    const proposed = await safePropose(options);
-    return options.autonomous === false ? proposed : autoAdvance(proposed, options);
+    const proposed = await safePropose(resumeOptions);
+    return options.autonomous === false ? proposed : autoAdvance(proposed, resumeOptions);
   }
   if (current.phase === 'brain_approving') {
     return options.autonomous === false ? { state: current } : autoAdvance({ state: current }, options);
@@ -2000,7 +2111,7 @@ async function resume(options = {}) {
   const resumed = await runCommand(['resume'], resumeOptions);
   if (['planning', 'hands_proposing'].includes(resumed.phase)) {
     const proposed = await safePropose(resumeOptions);
-    return options.autonomous === false ? proposed : autoAdvance(proposed, options);
+    return options.autonomous === false ? proposed : autoAdvance(proposed, resumeOptions);
   }
   if (resumed.phase === 'brain_approving') {
     return options.autonomous === false ? { state: resumed } : autoAdvance({ state: resumed }, options);
@@ -2083,6 +2194,9 @@ async function main() {
     return print(await runCommand([command, ...args]));
   }
   if (command === 'status' || command === 'log' || command === 'block' || command === 'pause' || command === 'cancel') {
+    if (command === 'pause' || command === 'cancel') {
+      await terminateAllActiveProcesses();
+    }
     return print(await runCommand([command, ...args]));
   }
   throw new Error('Unknown command: ' + command);
@@ -2123,18 +2237,30 @@ execute = wrapPhase('execute', execute);
 reviewResult = wrapPhase('reviewResult', reviewResult);
 invokeEvaluator = wrapPhase('invokeEvaluator', invokeEvaluator);
 
-module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError, getTelemetryDropped, drainTelemetry, autoCommitChunk, commitAcceptedChunk, isProviderFaultReason };
+module.exports = { readState, runCommand, runAgent, runAgentDetails, invokeAgent, invokeAgentWithRetry, retryableProviderError, proposalPrompt, proposalReviewPrompt, brainReviewPrompt: proposalReviewPrompt, consultationPrompt, evaluationPrompt, evaluatePrompt: evaluationPrompt, resultReviewPrompt, brainResultReviewPrompt: resultReviewPrompt, executionPrompt, validateConsultation, parseStructuredResult, isBrainConsultationEvent, isTransientConsultationBlock, propose, reviewProposal, reviewResult, invokeEvaluator, autoAdvance, consult, execute, start, resume, approve, revise, steer: revise, unlockAgent, withAgentLock, AgentBusyError, getTelemetryDropped, drainTelemetry, autoCommitChunk, commitAcceptedChunk, isProviderFaultReason, isSessionForkReason, hasDocumentedProviderFault, terminateProcessTree, terminateAllActiveProcesses };
 
 // Entry point runs last, after phase instrumentation is installed. main() is
 // async and starts executing immediately, so calling it any earlier would let
 // the first phase escape its span.
 if (require.main === module) {
+  const onSignal = async (sig) => {
+    try {
+      await terminateAllActiveProcesses();
+    } finally {
+      process.exit(sig === 'SIGINT' ? 130 : 143);
+    }
+  };
+  process.once('SIGINT', () => { void onSignal('SIGINT'); });
+  process.once('SIGTERM', () => { void onSignal('SIGTERM'); });
+
   process.on('uncaughtException', (err) => {
+    terminateAllActiveProcesses().catch(() => {});
     console.error('FATAL: ' + err.message);
     if (err.stack) console.error(err.stack);
     process.exit(1);
   });
   process.on('unhandledRejection', (reason) => {
+    terminateAllActiveProcesses().catch(() => {});
     const msg = reason instanceof Error ? reason.message : String(reason);
     const stack = reason instanceof Error ? reason.stack : '';
     console.error('FATAL: ' + msg);
@@ -2147,5 +2273,8 @@ if (require.main === module) {
       process.exitCode = 1;
     })
     // Pending telemetry appends hold the event loop, so this completes before exit.
-    .finally(() => drainTelemetry().catch(() => {}));
+    .finally(async () => {
+      await terminateAllActiveProcesses().catch(() => {});
+      await drainTelemetry().catch(() => {});
+    });
 }

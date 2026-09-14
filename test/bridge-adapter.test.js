@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const { runProcess, parseStructuredResult, extractSessionId, buildCodexArgs, buildOpencodeArgs } = require('../bridge-adapter');
+const { runProcess, parseStructuredResult, extractSessionId, buildCodexArgs, buildOpencodeArgs, terminateProcessTree, terminateAllActiveProcesses } = require('../bridge-adapter');
 
 const node = process.execPath;
 
@@ -65,6 +65,63 @@ test('runProcess timeout kills the whole process tree, not just the direct child
   if (process.platform === 'win32') {
     assert.ok(await waitDead(ids.grandchild), 'grandchild survived the timeout kill');
   }
+});
+
+test('runProcess abort via signal immediately terminates the whole process tree', async () => {
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    "const grandchild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });",
+    "process.stdout.write(JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }) + String.fromCharCode(10));",
+    "setTimeout(() => {}, 60000);"
+  ].join(' ');
+  const ac = new AbortController();
+  let stdoutData = '';
+  const promise = runProcess(node, js(parent), {
+    signal: ac.signal,
+    timeoutMs: 60000,
+    onLine: line => {
+      stdoutData += line;
+      if (line.includes('grandchild')) {
+        ac.abort();
+      }
+    }
+  });
+  await assert.rejects(promise, { name: 'AbortError' });
+  const ids = JSON.parse(stdoutData.trim().split(/\r?\n/)[0]);
+  assert.ok(ids.parent > 0);
+  assert.ok(ids.grandchild > 0);
+  assert.ok(await waitDead(ids.parent), 'direct child survived the abort signal');
+  assert.ok(await waitDead(ids.grandchild), 'grandchild survived the abort signal');
+});
+
+test('terminateAllActiveProcesses terminates all tracked active child process trees', async () => {
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    "const grandchild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });",
+    "process.stdout.write(JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }) + String.fromCharCode(10));",
+    "setTimeout(() => {}, 60000);"
+  ].join(' ');
+  let stdoutData = '';
+  let spawnedResolve;
+  const spawnedPromise = new Promise(r => { spawnedResolve = r; });
+  const promise = runProcess(node, js(parent), {
+    timeoutMs: 60000,
+    onLine: line => {
+      stdoutData += line;
+      if (line.includes('grandchild')) spawnedResolve();
+    }
+  });
+  await spawnedPromise;
+  const ids = JSON.parse(stdoutData.trim().split(/\r?\n/)[0]);
+  assert.ok(ids.parent > 0);
+  assert.ok(ids.grandchild > 0);
+  assert.equal(alive(ids.parent), true);
+  assert.equal(alive(ids.grandchild), true);
+
+  await terminateAllActiveProcesses();
+  assert.ok(await waitDead(ids.parent), 'parent survived terminateAllActiveProcesses');
+  assert.ok(await waitDead(ids.grandchild), 'grandchild survived terminateAllActiveProcesses');
+  await promise.catch(() => {});
 });
 
 test('runProcess timeout settles even when telemetry callback hangs', async () => {

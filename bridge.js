@@ -719,7 +719,7 @@ async function runnerIsAlive(cwd) {
   // moves state.json at least once per provider call, so an alive pid with both
   // the pid file and the state file idle past the longest single provider call
   // (computeMaxRunTimeoutMs: execution timeout + headroom) is a recycled pid.
-  const staleAfterMs = computeMaxRunTimeoutMs();
+  const staleAfterMs = computeMaxRunTimeoutMs(process.env, { chunks: 1 });
   const age = async file => {
     try { return Date.now() - (await fs.stat(file)).mtimeMs; } catch { return null; }
   };
@@ -744,7 +744,7 @@ function parseRunnerOutput(text) {
 }
 
 /** Colored structured output for non-TUI commands (status, pause, revise, etc.) */
-function printState(stateOrText) {
+function printState(stateOrText, cwd = process.cwd()) {
   const value = typeof stateOrText === 'string' ? parseRunnerOutput(stateOrText) : stateOrText;
   const state = value.state || value;
   const phase = state.phase || 'unknown';
@@ -769,6 +769,9 @@ function printState(stateOrText) {
   if (value.result?.summary) lines.push('HANDS: ' + value.result.summary);
   if (value.error) lines.push('Waiting: ' + value.error);
   if (state.blocked_reason) lines.push(ANSI.warn + '  ⚠  ' + state.blocked_reason + ANSI.reset);
+  if ((state.phase === 'hands_executing' || (state.phase === 'blocked_user' && state.recovery_required)) && hasValidInFlightChanges(state, cwd)) {
+    lines.push(ANSI.primary + '  Hint: In-flight changes are within chunk scope. Run bridge recover --review to advance directly to Brain review.' + ANSI.reset);
+  }
   if (value.message) lines.push(ANSI.muted + '  ' + value.message + ANSI.reset);
 
   lines.push('');
@@ -776,7 +779,7 @@ function printState(stateOrText) {
 }
 
 /** Back-compat alias — called from invoke() return paths */
-function printRunner(text) { printState(text); }
+function printRunner(text, cwd = process.cwd()) { printState(text, cwd); }
 
 function nextAction(state) {
   return {
@@ -814,13 +817,44 @@ function shorten(value, maxWidth) {
   return text.length > maxWidth ? text.slice(0, maxWidth - 1) + '…' : text;
 }
 
-function controlsFor(state) {
+function hasValidInFlightChanges(state, cwd = process.cwd()) {
+  if (state?.in_flight_scope_valid !== undefined) return Boolean(state.in_flight_scope_valid);
+  if (!state) return false;
+  const isRecovery = state.phase === 'hands_executing' || (state.phase === 'blocked_user' && Boolean(state.recovery_required));
+  if (!isRecovery) return false;
+  const scope = Array.isArray(state.attempt_scope) && state.attempt_scope.length
+    ? state.attempt_scope
+    : (state.approach?.files || []);
+  if (!scope.length || !state.git_before) return false;
+
+  try {
+    const { execFileSync } = require('node:child_process');
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd, encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    if (head !== state.git_before) return false;
+    const statusOut = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], { cwd, encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] });
+    const lines = statusOut.split(/\r?\n/).filter(Boolean);
+    const split = coordinatorLib.splitTreeLines(lines, coordinatorLib.treeIgnorePaths(cwd));
+    if (!split.blocking.length) return false;
+    const changed = [...new Set(split.blocking.flatMap(coordinatorLib.statusPaths))];
+    if (!changed.length) return false;
+    const approved = new Set(scope.map(coordinatorLib.repoPath).filter(Boolean));
+    const outOfScope = changed.filter(file => !approved.has(coordinatorLib.repoPath(file)));
+    return outOfScope.length === 0;
+  } catch {
+    return false;
+  }
+}
+
+function controlsFor(state, cwd = process.cwd()) {
   const controls = allowedControls(state);
   if (['needs_revision', 'escalation'].includes(state.block_kind)) {
     return ANSI.warn + 'bridge revise "guidance"' + ANSI.reset + ANSI.muted + '  [i] steer  [s] stop  [q] quit' + ANSI.reset;
   }
   if (state.block_kind === 'consultation_retry' || state.block_kind === 'dirty_tree') {
     return ANSI.warn + 'bridge resume' + ANSI.reset + ANSI.muted + '  [r] resume  [p] pause  [s] stop  [q] quit' + ANSI.reset;
+  }
+  if ((state.phase === 'hands_executing' || (state.phase === 'blocked_user' && state.recovery_required)) && hasValidInFlightChanges(state, cwd)) {
+    return ANSI.warn + 'bridge recover --review' + ANSI.reset + ANSI.muted + '  [c] recover  [p] pause  [s] stop  [q] quit' + ANSI.reset;
   }
   const autonomous = ['brain_autonomous', 'brain_approved'].includes(state?.autonomy?.mode);
   const shortcuts = { approve: '[a] approve', pause: '[p] pause', resume: '[r] resume', stop: '[s] stop', recover: '[c] recover' };
@@ -930,7 +964,7 @@ function renderDashboard(state, events, cwd, actions = [], runnerAlive = true) {
 
   // Controls
   rows.push(boxDiv(W));
-  rows.push(boxRow(controlsFor(state), W));
+  rows.push(boxRow(controlsFor(state, cwd), W));
   rows.push(boxBot(W));
 
   return rows.join('\n');
@@ -1163,7 +1197,7 @@ async function showStatus(cwd) {
       process.stderr.write(ANSI.warn + '  [WARN]  Project is using ' + gen.generation + ' legacy configuration. Run: bridge config migrate' + ANSI.reset + '\n\n');
     }
     const state = await readState(cwd);
-    printState(state);
+    printState(state, cwd);
   } catch (error) {
     // Fall back to coordinator output if state unreadable
     const output = await invoke(coordinator, ['status'], cwd);
@@ -1295,7 +1329,7 @@ function help() {
     cmd('bridge done "summary"',       'Mark session complete'),
 
     section('Recovery'),
-    cmd('bridge recover',              'Recover interrupted HANDS run'),
+    cmd('bridge recover [--review]',   'Recover interrupted HANDS run'),
     cmd('bridge unlock',               'Remove stale coordinator lock'),
     cmd('bridge unlock-agent',         'Remove stale HANDS agent lock'),
 
@@ -1775,7 +1809,7 @@ async function main() {
   }
   if (command === 'done') return printRunner(await invoke(runner, ['done', ...args], cwd));
   if (command === 'recover') {
-    const out = await invoke(coordinator, ['recover'], cwd);
+    const out = await invoke(coordinator, ['recover', ...args], cwd);
     process.stdout.write(ANSI.success + '  ✓  ' + ANSI.reset + out.trim() + '\n');
     return;
   }
@@ -1818,4 +1852,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive, waitForRunnerReady, spawnRunner, hasWatchStateChanged };
+module.exports = { readJsonLines, readState, setRepairRunner, renderSessionError, controlsFor, controlAllowed, runnerIsAlive, waitForRunnerReady, spawnRunner, hasWatchStateChanged, hasValidInFlightChanges };

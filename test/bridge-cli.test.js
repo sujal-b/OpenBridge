@@ -60,16 +60,31 @@ test('watch uses a single repainting terminal frame', async () => {
   assert.match(source, /recover/);
 });
 
-test('outer bridge kill timeout covers every runner timeout variable plus headroom', () => {
-  assert.equal(computeMaxRunTimeoutMs({}), 630000);
-  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_EXECUTION_TIMEOUT_MS: '1200000' }), 1230000);
-  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_PROPOSAL_TIMEOUT_MS: '900000' }), 930000);
-  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_CONSULT_TIMEOUT_MS: '900000' }), 930000);
-  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_AGENT_TIMEOUT_MS: '900000' }), 930000);
+test('outer bridge kill timeout covers every runner timeout variable plus headroom across chunks', () => {
+  assert.equal(computeMaxRunTimeoutMs({}), 5040000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_EXECUTION_TIMEOUT_MS: '1200000' }), 9840000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_PROPOSAL_TIMEOUT_MS: '900000' }), 7440000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_CONSULT_TIMEOUT_MS: '900000' }), 7440000);
+  assert.equal(computeMaxRunTimeoutMs({ MIND_LIMB_AGENT_TIMEOUT_MS: '900000' }), 7440000);
   assert.equal(
     computeMaxRunTimeoutMs({ MIND_LIMB_AGENT_TIMEOUT_MS: '900000', MIND_LIMB_EXECUTION_TIMEOUT_MS: '60000' }),
-    930000,
+    7440000,
     'a high AGENT_TIMEOUT alone must raise the wrapper kill above the execution default'
+  );
+  assert.equal(
+    computeMaxRunTimeoutMs({ MIND_LIMB_MAX_AUTO_CHUNKS: '1' }),
+    630000,
+    'a single chunk run yields the base single-phase timeout with headroom'
+  );
+  assert.equal(
+    computeMaxRunTimeoutMs({ MIND_LIMB_MAX_AUTO_CHUNKS: '2' }),
+    1260000,
+    'two chunks scale the runner kill timeout proportionally'
+  );
+  assert.equal(
+    computeMaxRunTimeoutMs({}, { chunks: 1 }),
+    630000,
+    'explicit options.chunks overrides default chunk count'
   );
 });
 

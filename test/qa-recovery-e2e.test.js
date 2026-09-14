@@ -22,6 +22,7 @@ const {
 
 const coordinator = path.resolve(__dirname, '..', 'bridge-coordinator.js');
 const bridgeCli = path.resolve(__dirname, '..', 'bridge.js');
+const { controlsFor } = require('../bridge');
 
 // ---------------------------------------------------------------------------
 // Harness (patterns from bridge-runner.test.js)
@@ -527,6 +528,95 @@ test('execution timeout after a file change: execution_recovery keeps the change
     assert.equal(provider.counts()['hands-consult'], 4, 'review + original consultation + fresh consultation + result review');
     assert.equal(provider.counts().hands, 2, 'one original attempt + one post-recovery execution');
     await assertInvariants(cwd);
+  } finally {
+    await cleanup(cwd);
+  }
+});
+
+test('MF-04: interrupted execution with valid in-flight files: recover --review advances cleanly to brain_reviewing and reviewResult auto-commits', async () => {
+  const cwd = await createGitWorkspace('qa-mf04-review-');
+  const provider = makeProvider(cwd, { spec: { hands: { from: 1, to: 1, mode: 'timeout' } }, writeOnTimeoutExecute: true });
+  const opts = autoOptions(cwd, provider);
+  try {
+    const blocked = await start('QA MF-04 recover for review', opts);
+    assert.equal(blocked.state.phase, 'blocked_user');
+    assert.equal(blocked.state.block_kind, 'execution_recovery');
+    assert.equal(blocked.state.recovery_required, true);
+
+    // The partial change was written and is within the approved scope (README.md)
+    const readme = await fs.readFile(path.join(cwd, 'README.md'), 'utf8');
+    assert.match(readme, /partial edit from timed-out HANDS/);
+
+    // Check status and controls hint bridge recover --review
+    const statusCli = spawnSync(process.execPath, [bridgeCli, 'status', '--project', cwd], { cwd, encoding: 'utf8' });
+    assert.equal(statusCli.status, 0);
+    assert.match(statusCli.stdout, /recover --review/i);
+
+    const state = await readState(opts);
+    const controls = controlsFor(state, cwd);
+    assert.match(controls, /bridge recover --review/);
+
+    // Running bridge recover --review advances cleanly to brain_reviewing
+    const recovered = await runProcess(process.execPath, [bridgeCli, 'recover', '--review', '--project', cwd], { cwd });
+    assert.equal(recovered.ok, true, 'bridge recover --review failed: ' + recovered.stderr);
+
+    const reviewingState = await readState(opts);
+    assert.equal(reviewingState.phase, 'brain_reviewing');
+    assert.equal(reviewingState.active_agent, 'mind');
+    assert.equal(reviewingState.recovery_required, false);
+    assert.equal(reviewingState.execution_claimed, false);
+    assert.equal(reviewingState.git_status, 'changes_present');
+
+    // reviewResult can accept and auto-commit the files
+    const finished = await reviewResult({ decision: 'completed', summary: 'Executed QA slice.' }, opts);
+    assert.equal(finished.state.phase, 'done');
+    assert.equal(finished.chunkCommit?.committed, true);
+
+    const gitStatus = spawnSync('git', ['status', '--porcelain=v1'], { cwd, encoding: 'utf8' });
+    assert.equal(gitStatus.stdout.trim(), '', 'working tree should be clean after auto-commit');
+
+    const log = spawnSync('git', ['log', '-1', '--pretty=%s'], { cwd, encoding: 'utf8' });
+    assert.match(log.stdout, /bridge\(chunk\):/);
+
+    await assertInvariants(cwd);
+  } finally {
+    await cleanup(cwd);
+  }
+});
+
+test('MF-04: recover --review refuses when out-of-scope files exist or tree is clean', async () => {
+  const cwd = await createGitWorkspace('qa-mf04-violations-');
+  const provider = makeProvider(cwd, { spec: { hands: { from: 1, to: 1, mode: 'timeout' } }, writeOnTimeoutExecute: true });
+  const opts = autoOptions(cwd, provider);
+  try {
+    const blocked = await start('QA MF-04 violations check', opts);
+    assert.equal(blocked.state.phase, 'blocked_user');
+    assert.equal(blocked.state.recovery_required, true);
+
+    // 1. Out-of-scope file
+    await fs.writeFile(path.join(cwd, 'out-of-scope.txt'), 'rogue edit\n', 'utf8');
+    const outOfScopeRecover = await runProcess(process.execPath, [bridgeCli, 'recover', '--review', '--project', cwd], { cwd });
+    assert.equal(outOfScopeRecover.ok, false, 'recover --review must fail on out-of-scope files');
+    assert.match(outOfScopeRecover.stderr + outOfScopeRecover.stdout, /scope violation/i);
+
+    // State still blocked
+    let state = await readState(opts);
+    assert.equal(state.phase, 'blocked_user');
+    assert.equal(state.recovery_required, true);
+
+    // Clean up out-of-scope file
+    await fs.rm(path.join(cwd, 'out-of-scope.txt'), { force: true });
+
+    // 2. Clean tree (revert in-scope change)
+    spawnSync('git', ['checkout', '--', 'README.md'], { cwd, encoding: 'utf8' });
+    const cleanTreeRecover = await runProcess(process.execPath, [bridgeCli, 'recover', '--review', '--project', cwd], { cwd });
+    assert.equal(cleanTreeRecover.ok, false, 'recover --review must fail on clean tree');
+    assert.match(cleanTreeRecover.stderr + cleanTreeRecover.stdout, /requires changes present/i);
+
+    // State still blocked
+    state = await readState(opts);
+    assert.equal(state.phase, 'blocked_user');
+    assert.equal(state.recovery_required, true);
   } finally {
     await cleanup(cwd);
   }

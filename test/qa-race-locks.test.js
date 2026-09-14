@@ -38,6 +38,23 @@ function gate(trigger = null, release = null) {
   return { started, unblock };
 }
 
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
+  }
+}
+
+async function waitDead(pid, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline && alive(pid)) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  return !alive(pid);
+}
+
 function coordinatorPassthrough(command, args, options) {
   if (command === process.execPath && args[0] === coordinator) return runProcess(command, args, options);
   return null;
@@ -402,6 +419,62 @@ test('stale state: concurrent approach during an in-flight proposal yields stale
   assert.equal(outcome.state.revision, 1);
   const final = await assertFinalIntegrity(cwd);
   assert.equal(final.events.filter(event => event.type === 'approach_submitted').length, 1, 'runner must not replay the approach');
+  assert.equal(await lockExists(cwd), false);
+});
+
+test('stale state: in-flight process tree is immediately terminated on session pause / preemption', async () => {
+  const cwd = await planningWorkspace();
+  const parent = [
+    "const { spawn } = require('node:child_process');",
+    "const grandchild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });",
+    "process.stdout.write(JSON.stringify({ parent: process.pid, grandchild: grandchild.pid }) + String.fromCharCode(10));",
+    "setTimeout(() => {}, 60000);"
+  ].join(' ');
+  let pids = null;
+  let pidsResolve;
+  const pidsPromise = new Promise(r => { pidsResolve = r; });
+  const inFlight = propose({
+    cwd,
+    command: process.execPath,
+    retryDelayMs: 0,
+    runProcess: (command, args, options) => {
+      const real = coordinatorPassthrough(command, args, options);
+      if (real) return real;
+      return runProcess(process.execPath, ['-e', parent], {
+        ...options,
+        timeoutMs: 60000,
+        onLine: (line, stream) => {
+          if (options.onLine) options.onLine(line, stream);
+          if (!pids && line.includes('grandchild')) {
+            try {
+              pids = JSON.parse(line.trim());
+              pidsResolve(pids);
+            } catch {}
+          }
+        }
+      });
+    }
+  });
+
+  await pidsPromise;
+  assert.ok(pids && pids.parent > 0);
+  assert.ok(pids && pids.grandchild > 0);
+  assert.equal(alive(pids.parent), true);
+  assert.equal(alive(pids.grandchild), true);
+
+  // Side channel pauses the session
+  run(cwd, ['pause']);
+  const pausedState = await readStateFile(cwd);
+  assert.equal(pausedState.phase, 'paused');
+
+  // inFlight should detect preemption/stale state and terminate processes
+  const outcome = await inFlight;
+  assert.match(outcome.error, /stale_state|changed while the agent was starting|Session preempted|found paused/);
+  assert.equal(outcome.state.phase, 'paused');
+
+  // Both parent and grandchild must be terminated immediately rather than left running
+  assert.ok(await waitDead(pids.parent), 'parent process survived after session pause');
+  assert.ok(await waitDead(pids.grandchild), 'grandchild process survived after session pause');
   assert.equal(await lockExists(cwd), false);
 });
 
