@@ -1,279 +1,188 @@
-# Mind-Limb Bridge
+<p align="center">
+  <h1 align="center">OpenBridge</h1>
+  <p align="center"><em>formerly Mind-Limb Bridge</em> · binary <code>bridge</code></p>
+  <p align="center">HANDS builds in small autonomous chunks. Brain reviews each one. You watch.</p>
+  <p align="center">
+    <a href="https://github.com/sujal-b/OpenBridge/actions"><img src="https://img.shields.io/github/actions/workflow/status/sujal-b/OpenBridge/ci.yml?branch=main&label=CI%20%28ubuntu%20%7C%20windows%29&logo=github" alt="CI ubuntu | windows"></a>
+    <a href="https://nodejs.org"><img src="https://img.shields.io/badge/node-%3E%3D22-brightgreen?logo=node.js" alt="node >=22"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-yellow.svg" alt="MIT"></a>
+    <img src="https://img.shields.io/badge/version-v0.1.0-blue" alt="v0.1.0">
+  </p>
+</p>
 
-A small local Brain (MIND/Codex) <-> HANDS (OpenCode) workflow with autonomous
-Brain handoffs, visibility, and one active agent at a time.
+| **v0.1.0** | **36 commits** on `main` | **29 test files** | **4 eval suites** | **~30 CLI commands** | **Node >=22** | **CI ubuntu + windows** |
 
-## Model routing
+## 30 second quickstart
 
-- HANDS, HANDS-PROPOSE, HANDS-CONSULT, and HANDS-EVALUATE use `opencode/muse-spark-1.2-contributor-free` (Zen, via `opencode run` subprocess).
-- MIND (Brain) uses `opencode/muse-spark-1.3-contributor-free` (Zen, via `opencode run` subprocess with the `brain` agent profile) — never direct HTTPS.
-
-## Public commands
+**Prereqs:** Node >=22, Git with one baseline commit, [opencode CLI](https://opencode.ai) installed and authenticated.
 
 ```powershell
-bridge install
-bridge open .
-bridge run "Add upload validation"
-bridge watch
-bridge inspect
-bridge status
-bridge unlock
-bridge unlock-agent
+bridge install          # install global command once, from any folder
+bridge open .           # prepare existing project
+bridge run "Add upload validation"  # start task + live dashboard
 ```
 
-For a new disposable or mock project, use one command:
+Fresh project: `bridge new "D:\Projects\My-New-Project" --name "Your Name" --email "you@example.com"` then `bridge run "your task"` (`--name`/`--email` optional if Git identity exists).
 
-```powershell
-bridge new "D:\Projects\Bridge-Mock-E2E" --name "Sujal Barwad" --email "sujal.barwad27@gmail.com"
-Set-Location "D:\Projects\Bridge-Mock-E2E"
-bridge run "your task"
+`bridge open .` creates `.opencode/agents/` and updates `.gitignore` (idempotent, preserves existing content). Global settings never changed. `ask-codex` MCP still needs one time install.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[proposal] --> B[Brain evaluates]
+    B --> C[read-only consultation]
+    C --> D[one execution lease]
+    D --> E[HANDS-EVALUATE / Brain review]
+    E -->|passed| F[done - auto-commit]
+    E -->|needs change| G[revise - new chunk]
+    G --> A
 ```
 
-The `--name` and `--email` flags are optional when Git identity is already configured globally. For an existing project, keep using `bridge open`.
-
-`bridge open .` also creates missing project-local OpenCode profiles under
-`.opencode/agents/` and creates or updates the root `.gitignore` with
-`.bridge/`, `.opencode/`, `node_modules/`, and `dist/` runtime entries. Existing
-`.gitignore` content and profiles are preserved; entries are added idempotently.
-It never changes global settings. The consultation profile allows only the Brain MCP
-tool; the execution profile may edit only approved files, while evaluation denies edits, subagents,
-skills, and external-directory access. `hands-evaluate` is the read-only role
-for checking the completed chunk and its validation evidence. The global `ask-codex` MCP server must still be
-installed once. Because the profiles are project files, run `bridge open .`
-before creating the first baseline commit, or commit the newly-created
-`.opencode/agents/` files once in an existing repository.
-
-bridge run starts or continues the current task. HANDS proposes one small chunk
-with named files and focused validation. The bridge requires a Git repository
-with a baseline commit before the Brain <-> HANDS handoff. The autonomous sequence is:
-
-    proposal -> Brain evaluates -> read-only Brain consultation -> one execution lease -> HANDS-EVALUATE/Brain review
-
-The loop advances without an ordinary user approval prompt. `bridge approve` remains
-a compatibility command for manually controlled sessions. Only the lease holder can
-execute the approved files. A lease is claimed once;
-if execution is interrupted, recovery invalidates it and the next run must
-consult Brain again. A new chunk cannot start until Brain uses bridge done or
-bridge revise.
-
-If HANDS cannot make a safe, reviewable proposal because of a material dependency, it stops safely. Answer it with:
-bridge revise "Use the minimal implementation with focused tests"
+- HANDS proposes one chunk with named files and focused validation. Loop runs without a manual approval prompt.
+- Single use lease, only the holder can execute approved files. Interrupted execution invalidates the lease, next run consults Brain again.
+- No new chunk until Brain runs `bridge done` or `bridge revise`.
+- If HANDS cannot make a safe proposal (missing dependency), it stops. Continue with `bridge revise "Use the minimal implementation with focused tests"`.
 
 ```powershell
-# Only needed when a proposal is blocked or needs correction
 bridge revise "Use a smaller change and add a unit test"
 bridge done "Reviewed changes and tests pass"
 ```
 
-For a project in another folder, add `--project <folder>` to any command.
+**Live monitoring:**
 
-## Live monitoring
+- `bridge watch` repaints one frame, Flow shows handoff and Evaluation shows latest review (`hands_consulting` waits for Brain, `hands_executing` shows chunk).
+- `bridge inspect` opens browser inspector with MIND/HANDS summaries, timeline per chunk, sanitized tool cards, terminal synced controls.
+- Most commands accept `--project <folder>`.
 
-`bridge watch` is the compact terminal dashboard. It repaints one frame, so it
-does not print the same status repeatedly. The Flow line shows the autonomous
-Brain <-> HANDS handoff and Evaluation shows the latest read-only review. During
-`hands_consulting`, it shows
-that HANDS is waiting for Brain guidance; during `hands_executing`, it shows
-the claimed chunk and the live activity summary.
+Dashboard keys: `[i]` steer · `[a]` approve · `[p]` pause · `[r]` resume · `[s]` stop · `[q]` quit
 
-`bridge inspect` starts a local browser inspector and prints its URL. The
-inspector provides a live Control Room with separate MIND/Codex and HANDS/OpenCode summaries, an expandable live timeline, grouped by task chunk, with
-agent/action/risk/status cards, sanitized tool summaries, details on demand,
-and controls synchronized with the terminal. It shows waiting/stale connection status and prevents duplicate controls while one command is running. The Bridge is the only control surface; the agent panels are views. It does not start work by itself.
+## Model routing
 
-Use `bridge policy` to view the project safety policy.
+| Role | Model | How it runs |
+|------|-------|-------------|
+| HANDS, HANDS-PROPOSE, HANDS-CONSULT, HANDS-EVALUATE | `opencode/muse-spark-1.2-contributor-free` | `opencode run` subprocess |
+| MIND / Brain | `opencode/muse-spark-1.3-contributor-free` | `opencode run` with `brain` agent profile |
 
-## Latency instrumentation
+Brain never uses direct HTTPS. Consultation allows only Brain MCP tool. Execution may edit only approved files. Evaluation denies edits, subagents, skills, external access.
 
-Every autonomous run records timing spans to `.bridge/latency.jsonl`: phase
-wall time (propose, consult, execute, review), provider process cold-start
-versus work time, Brain HTTP DNS/connect/TTFB/total with retry attempts,
-coordinator subprocess calls per chunk, prompt/response sizes, and git
-snapshots taken under the state lock.
+## Command reference
 
-```powershell
-bridge latency              # P50/P95 per span, sorted by total time
-bridge latency --json       # machine-readable summary
-bridge latency --clear      # reset the collected data
-```
+All commands match `bridge --help`. Most accept `--project <folder>`.
 
-Notes:
+| Command | What it does |
+|---------|--------------|
+| `bridge install` | Install global bridge command |
+| `bridge new <folder>` | Create project with Git baseline |
+| `bridge open [folder]` | Prepare existing project |
+| `bridge doctor` | Check installation health |
+| `bridge run "task"` | Start task and open dashboard |
+| `bridge watch` | Attach dashboard to running session |
+| `bridge inspect` | Open browser inspector |
+| `bridge steer "guidance"` | Inject guidance mid flight |
+| `bridge pause` | Pause session |
+| `bridge resume` | Continue paused session |
+| `bridge stop` | Cancel session |
+| `bridge approve` | Manual approval (legacy compat) |
+| `bridge revise "guidance"` | Revised guidance after a block |
+| `bridge done "summary"` | Mark session complete |
+| `bridge recover [--review]` | Recover interrupted HANDS run |
+| `bridge unlock` | Remove stale coordinator lock |
+| `bridge unlock-agent` | Remove stale HANDS agent lock |
+| `bridge status` | Show current session state |
+| `bridge history [n]` | Show last n audit entries |
+| `bridge policy` | Show project safety policy |
+| `bridge latency [--json]` | P50/P95 per phase |
+| `bridge latency --clear` | Reset latency data |
+| `bridge config` | Show Brain and Hands config |
+| `bridge config migrate` | Migrate legacy project to gen3 |
+| `bridge config brain list` | List available Brain providers |
+| `bridge config brain add <n>` | Add custom Brain provider |
+| `bridge config brain rm <n>` | Remove custom Brain provider |
+| `bridge config brain use <n>` | Set active Brain provider |
+| `bridge config hands list` | List Hands providers |
+| `bridge config hands add <p> <m>` | Add Hands model |
+| `bridge config hands use <p> <m>` | Set active Hands model |
+| `bridge --version` / `-v` | Show version number |
 
-- Spans are buffered in memory and flushed on a timer; the instrumentation
-  never takes the telemetry lock, so measuring a run does not change its
-  timing.
-- `phase.execute` includes `phase.reviewResult` when the run continues
-  autonomously; nested phases are marked `nested:true` in the raw spans.
-- `git.snapshot` reports `under_lock` — time spent in git while holding the
-  coordinator state lock.
-- The file rotates at 4 MB to `latency.jsonl.1`. Set `MIND_LIMB_LATENCY=0`
-  to disable recording entirely.
+## Project status
 
-## Provider fallback
-
-Read-only HANDS proposals retry once by default after transient provider
-failures, invalid structured output, or timeouts. A hard provider fault
-(HTTP 5xx, `UnknownError`, server crash) drops the poisoned session and
-retries with a **fresh session** — reusing a session that just server-faulted
-reproduces the fault. Provider error payloads are humanized before they reach
-the state record: you see `Provider server error: UnknownError — Unexpected
-server error (ref err_...)` instead of a raw JSON blob, and the provider ref
-stays for debugging. Code execution is not blindly replayed after a failure;
-the bridge escalates it for user inspection first.
-
-OpenCode JSON mode is an event stream. The bridge unwraps the final decision
-from event text such as part.text, keeps parsing bounded per event, and
-tolerates harmless markdown/progress wrappers without treating arbitrary
-provider text as approval.
-
-Optional PowerShell settings:
-
-    $env:MIND_LIMB_AGENT_RETRY_ATTEMPTS = 2
-    $env:MIND_LIMB_AGENT_RETRY_DELAY_MS = 250
-    $env:MIND_LIMB_PROPOSAL_TIMEOUT_MS = 180000
-    $env:MIND_LIMB_EXECUTION_TIMEOUT_MS = 600000
-    $env:MIND_LIMB_AGENT_TIMEOUT_MS = 300000
-    $env:MIND_LIMB_MAX_CHUNK_FILES = 3
-    $env:MIND_LIMB_BRIDGE_TIMEOUT_MS = 630000
-
-When Brain consultation succeeds through the direct API, the bridge skips the
-redundant HANDS echo-confirm call and mints the execution lease directly (the
-coordinator consultation gate still validates the record). Set
-`MIND_LIMB_REQUIRE_CONSULT_CONFIRM = 1` to restore the extra HANDS-CONSULT
-round trip.
-
-Coordinator commands issued by the runner execute in-process (one Node process
-total instead of one boot per state mutation). The file-lock protocol is
-unchanged, so CLI, TUI, and inspector subprocess callers interleave safely. Set
-`MIND_LIMB_COORD_INPROCESS = 0` to force the runner back to spawning
-`bridge-coordinator.js` per command.
-
-Startup is also leaner: `bridge open` prepares the project concurrently and
-skips initialization when the store is already present, and`bridge run` auto-resumes a blocked session (dirty tree, provider failures,
-revisions pending): `run` means "continue", always. The only refusals carry
-their remedy: `bridge recover` after interrupted execution, or a decision
-(`bridge revise` / `bridge done`) after a policy escalation or material
-proposal blocker. `bridge run` returns the moment the runner's first state mark lands in `.bridge/state.json`
-(process death or a 5 s cap cut the wait short — set
-`MIND_LIMB_RUNNER_READY_MS` to widen the cap). Brain HTTP calls reuse one
-keep-alive TLS connection per host, and repeated config reads are served from
-an mtime-keyed cache, so per-chunk overhead stays flat as sessions grow.
-
-Execution is not automatically retried because HANDS may have edited files
-before a timeout. Inspect first, then run:
-
-    bridge recover
-    bridge resume
-
-The bridge will create a fresh Brain consultation and a fresh execution lease.
-It will not replay the old lease.
-
-bridge resume is deliberately refused until bridge recover acknowledges
-the inspection. This prevents duplicate edits.
-## Interrupted execution
-
-If a terminal closes while HANDS is executing, inspect the working tree first.
-If no HANDS process is running, use:
-
-```powershell
-bridge recover
-bridge resume
-bridge run
-```
-
-Recovery refuses to change state while a live provider lock exists. Stale locks
-are only removed when ownership is proven dead or the user explicitly requests
-stale-lock cleanup.
-
-## Working tree and Git ownership
-
-The bridge never commits your own work. It manages only the tree churn its own
-execution produced:
-
-- **Before a chunk runs** (proposal preflight and the approval gate), the tree
-  must be clean. The block lists the offending files (first 10), so stray
-  `.env` files, editor droppings, or unrelated edits are self-diagnosing.
-  The one-step remedy is `bridge resume --commit "checkpoint"` — it commits
-  your changes and resumes in the same command (custom message optional;
-  a user-staged index is never swept in). The proposal still stands and
-  no re-proposal is needed. `bridge revise` is refused at this block because
-  it cannot clean a tree.
-- **Bridge-owned scaffold never blocks.** Files the bridge itself created
-  (`opencode.json` via `bridge open`/`new`) are recorded with a content hash in
-  `.bridge/scaffold.json` and auto-committed when still untracked and unchanged.
-  If you edit a scaffold file, it becomes yours — it blocks like any other
-  dirt and the `resume --commit` remedy applies. Runtime data directories
-  (`.omo/`, `.opencode/`, `.claude/`, …) are exempt without a manifest.
-- **Agent/tool runtime data is exempt.** Untracked files under known agent
-  and tool runtime directories (`.omo/`, `.claude/`, `.cursor/`, `.codex/`,
-  and others — the runtime hosting the HANDS session writes
-  `.omo/run-continuation/*.json` mid-session) never count as dirt: not at the
-  gate, not in the completion scope check, not in the auto-commit. Tracked
-  changes inside those directories still block. For other generated paths,
-  add them to `.gitignore` or to `approval.ignorePaths` in
-  `.bridge/policy.json`; `bridge new`/`open` scaffold the known ones.
-- **Revision cycles are hands-free.** When the Brain rejects a chunk result,
-  the rejected attempt's own changes may stay in the tree: re-proposal,
-  re-approval, and re-execution tolerate them as long as HEAD sits on the
-  chunk baseline and every dirty file is inside the chunk's accumulated
-  approved scope. Anything you add — or a commit you make mid-cycle — snaps
-  the strict clean-tree rule back on.
-- **Accepted chunks are auto-committed.** When the Brain accepts a chunk
-  result (or you confirm with `bridge done`), exactly the chunk's accepted
-  files are committed as `bridge(chunk): <task>`. Your own staging is never
-  swept in (the commit is skipped instead), and files outside the chunk scope
-  stay uncommitted for you to handle. With no Git identity configured, the
-  commit falls back to a `mind-limb-bridge` identity.
-
-You stay on the keyboard only for work that is genuinely yours.
+- **Version:** v0.1.0 (`mind-limb-bridge` in package.json, MIT, `engines: node >=22`, bin `bridge`)
+- **History:** 36 commits on `main` (remote `https://github.com/sujal-b/OpenBridge`)
+- **CI:** GitHub Actions on `ubuntu-latest` and `windows-latest` with Node 22
+- **Tests:** 29 files under `test/`, run with `npm test` (`node --test "test/*.test.js"`)
+- **Suites:** 4 eval suites (`evaluate.ps1`, `evaluate-control-room.ps1`, `evaluate-recovery.ps1`, `preprod-evaluate.ps1`) plus `qa-*` Node suites
 
 ## Safety and records
 
-- `.bridge/state.json` is the authoritative state.
-- `.bridge/state.json.corrupt-*` keeps a repaired corrupt snapshot for up to 7 days.
-- `.bridge/events.jsonl` is the lifecycle overview log.
-- `.bridge/actions.jsonl` records bounded provider/tool summaries with target path, op, and command; secrets are redacted.
-- `.bridge/policy.json` stores safe defaults and project overrides.
-- `.bridge/agent.lock` prevents parallel HANDS calls.
-- The HANDS session ID is preserved across chunks.
-- A dirty Git tree blocks the Brain <-> HANDS execution handoff as a `dirty_tree`
-  block that `bridge resume` re-enters after cleanup; a revision cycle tolerates
-  its own attempt's changes, and accepted chunks are auto-committed (see
-  "Working tree and Git ownership"). Non-Git projects cannot enter execution.
-- Changed files are checked against the approved file list, including untracked,
-  deleted, renamed, and out-of-scope paths.
-- Provider failures can be resumed; material proposal blockers require bridge revise.
-- `hands-evaluate` is read-only and reports pass/fail evidence without changing files.
-- A single-use execution lease prevents duplicate provider execution.
-- State, plan, and event commits have a short crash-recovery journal.
+- `.bridge/state.json` is authoritative. `.bridge/state.json.corrupt-*` keeps repaired snapshot for 7 days.
+- `.bridge/events.jsonl` is lifecycle log. `.bridge/actions.jsonl` records bounded tool summaries with redacted secrets.
+- `.bridge/policy.json` holds safe defaults and overrides. View with `bridge policy`.
+- `.bridge/agent.lock` prevents parallel HANDS calls. HANDS session ID preserved across chunks.
+- Single use execution lease prevents duplicate execution.
+- Dirty tree blocks execution as `dirty_tree`. Remedy: `bridge resume --commit "checkpoint"` (custom message optional, staged index never swept).
+- Non-Git projects cannot enter execution. Changed files checked against approved list (untracked, deleted, renamed, out of scope).
+- `hands-evaluate` is read only, reports pass or fail without changing files.
+- Provider failures can be resumed. Material proposal blockers require `bridge revise`.
+- Recover before resume: `bridge recover` then `bridge resume` then `bridge run`. Stale locks removed only when ownership proven dead.
+- Accepted chunks auto committed as `bridge(chunk): <task>`. Only chunk scope committed, your staging never swept.
 
-## Validation
+## Advanced (deep dives)
 
-Run the dependency-free baseline checks:
+<details>
+<summary>Latency instrumentation</summary>
 
-```powershell
-& .\evaluate.ps1
-```
-
-Run the focused Control Room checks first:
-
-    & .\evaluate-control-room.ps1
-
-Run the recovery checks:
-
-    & .\evaluate-recovery.ps1
-
-The `qa-*` Node suites cover detector, recovery, state, race, and CLI regressions.
-`MIND_LIMB_AGENT_TIMEOUT_MS` supplies proposal, execution, and consultation defaults;
-per-command `--timeout-ms` takes precedence, then this variable, then built-in defaults.
-
-Run the isolated pre-production suite:
+- Every run records spans to `.bridge/latency.jsonl`: phase wall time, provider cold start vs work, Brain HTTP timings, coordinator calls, prompt/response sizes, git snapshots under lock.
+- Spans buffered, flushed on timer. Never takes telemetry lock.
+- `phase.execute` includes `phase.reviewResult` when run continues. Nested phases `nested:true`.
+- `git.snapshot` reports `under_lock` time. Rotates at 4 MB. Set `MIND_LIMB_LATENCY=0` to disable.
 
 ```powershell
-& .\preprod-evaluate.ps1
+bridge latency              # P50/P95 per span
+bridge latency --json       # machine readable
+bridge latency --clear      # reset data
 ```
 
-The suite covers CLI behavior, coordinator transitions, atomic/recoverable
-state commits, provider adapter timeouts, session reuse, no-parallel locking,
-telemetry concurrency, live inspector HTTP/SSE behavior, bounded long logs,
-sequential chunks, concurrent mutation attempts, stale locks, and Git checks.
+</details>
+
+<details>
+<summary>Provider fallback</summary>
+
+- Read only proposals retry once after transient failures, invalid output, or timeouts.
+- Hard fault (HTTP 5xx, `UnknownError`, crash) drops poisoned session and retries fresh. Reusing faulted session reproduces fault.
+- Error payloads humanized: `Provider server error: UnknownError (ref err_...)` keeps ref for debugging. Code not blindly replayed after failure.
+- OpenCode JSON is an event stream. Bridge unwraps decision from `part.text`, tolerates markdown wrappers without treating text as approval.
+- Optional env vars: `MIND_LIMB_AGENT_RETRY_ATTEMPTS=2`, `MIND_LIMB_AGENT_RETRY_DELAY_MS=250`, `MIND_LIMB_PROPOSAL_TIMEOUT_MS=180000`, `MIND_LIMB_EXECUTION_TIMEOUT_MS=600000`, `MIND_LIMB_AGENT_TIMEOUT_MS=300000`, `MIND_LIMB_MAX_CHUNK_FILES=3`, `MIND_LIMB_BRIDGE_TIMEOUT_MS=630000`.
+- Direct API consultation skips redundant HANDS echo. Set `MIND_LIMB_REQUIRE_CONSULT_CONFIRM=1` to restore it.
+- Runner commands run in process. Set `MIND_LIMB_COORD_INPROCESS=0` to spawn per command.
+- `bridge run` returns on first state mark in `.bridge/state.json` (cap 5s, tune `MIND_LIMB_RUNNER_READY_MS`). Brain HTTP reuses TLS, config reads use mtime cache.
+
+</details>
+
+<details>
+<summary>Git ownership and working tree</summary>
+
+- Bridge never commits your own work, only its own execution churn.
+- Before a chunk runs the tree must be clean. Block lists first 10 offending files. Remedy: `bridge resume --commit "checkpoint"` commits and resumes. `bridge revise` refused at this block.
+- Scaffold files (`opencode.json` via `bridge open`/`new`) tracked by hash in `.bridge/scaffold.json` and auto committed when untracked and unchanged. Edited scaffold becomes yours and blocks.
+- Agent runtime dirs (`.omo/`, `.opencode/`, `.claude/`, `.cursor/`, `.codex/`, etc.) untracked files never count as dirt. Tracked changes inside them still block. For other generated paths add to `.gitignore` or `approval.ignorePaths` in `.bridge/policy.json`.
+- Revision cycles are hands free: rejected attempt changes may stay if HEAD is on chunk baseline and every dirty file is inside accumulated approved scope. Anything you add or commit mid cycle snaps strict clean rule back.
+- `bridge run` auto resumes blocked sessions (dirty tree, provider failures, revisions pending). Only refusals are `bridge recover` after interrupted execution, or `bridge revise`/`bridge done` after policy escalation.
+
+</details>
+
+<details>
+<summary>Validation</summary>
+
+- Baseline: `& .\evaluate.ps1`
+- Control Room: `& .\evaluate-control-room.ps1`
+- Recovery: `& .\evaluate-recovery.ps1`
+- Isolated preprod: `& .\preprod-evaluate.ps1`
+- Coverage: CLI behavior, coordinator transitions, atomic state commits, provider timeouts, session reuse, no parallel locking, telemetry concurrency, inspector HTTP/SSE, bounded logs, sequential chunks, concurrent mutations, stale locks, Git checks.
+- `qa-*` Node suites cover detector, recovery, state, race, CLI regressions. `MIND_LIMB_AGENT_TIMEOUT_MS` is default for proposal/execution/consultation. Per command `--timeout-ms` takes precedence.
+
+</details>
+
+---
+
+MIT License, see [LICENSE](LICENSE). Start with `bridge run "your task"`.
